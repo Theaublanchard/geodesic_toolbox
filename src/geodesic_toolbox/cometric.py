@@ -1011,6 +1011,10 @@ class CentroidsCometric(CoMetric):
             self.register_buffer("centroids", centroids)
         if cometric_centroids is not None:
             self.register_buffer("cometric_centroids", cometric_centroids)
+            if cometric_centroids.ndim == 2:
+                self.is_diag = True
+            else:
+                self.is_diag = False
         self.register_buffer("temperature", Tensor([temperature]))
         self.register_buffer("reg_coef", Tensor([reg_coef]))
         self.register_buffer("temperature_scale", Tensor([temperature_scale]))
