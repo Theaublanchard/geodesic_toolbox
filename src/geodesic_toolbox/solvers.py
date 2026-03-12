@@ -963,89 +963,115 @@ class SolverGraph(GeodesicDistanceSolver):
         self.b_size = batch_size
         self.smooth_curve = smooth_curve
 
-        self.W, self.knn = self.init_knn_graph(data, n_neighbors, batch_size)
+        self._A, self.knn = self.compute_connectivity_matrix(data, n_neighbors)
+        self.W = self.compute_weights(self._A, data, batch_size)
+
         self.predecessors = self.get_predecessors(self.W)
 
-    @torch.no_grad()
-    def init_knn_graph(
-        self, data: torch.Tensor, n_neighbors: int, b_size: int = 64
-    ) -> torch.Tensor:
-        """Initialize the graph using a KNN graph.
-
-        Parameters
-        ----------
-        data : torch.Tensor (N,D)
-            The data points
-        n_neighbors : int
-            The number of neighbors to use
-        b_size : int
-            The size of the batch to use for the computation
-
-        Returns
-        -------
-        W : torch.Tensor (N,N)
-            The weight matrix of the graph
-        knn : NearestNeighbors
-            The KNN object
+    def compute_connectivity_matrix(self, data: torch.Tensor, n_neighbors: int):
         """
-        # We add one to the number of neighbors to remove the point itself
-        print("Fitting KNN graph...")
+        Compute the connectivity matrix from the graph.
+        If the graph is not weakly connected, we connect the different components by adding edges between the closest points of the different components.
+
+        Parameters:
+        data : torch.Tensor (N,D)
+            The data points to use to compute the graph
+        n_neighbors : int
+            The number of neighbors to use for the KNN graph
+
+        Returns:
+        A : torch.Tensor (N,N)
+            The adjacency matrix of the graph
+        knn : NearestNeighbors
+            The KNN object used for inference
+        """
+        # Maybe radius graph is better ?
         knn = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm="ball_tree", n_jobs=-1)
         knn.fit(data.cpu())
-        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(1, 1, -1, 1)
 
         # Find the Euclidean kNN
         N_data = data.shape[0]
         _, indices = knn.kneighbors(data.cpu())
         indices = indices[:, 1:]  # Remove the point itself, (N_data, k)
-        # Weight_matrix = np.zeros((N_data, N_data))
-        Weight_matrix = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
+        A = np.zeros((N_data, N_data), dtype=int)
+        batch_idx = torch.arange(N_data).view(-1, 1)
+        A[batch_idx, indices] = 1
+        if not is_connected(Graph(A)):
+            print("Adjacency Graph is not connected : connecting ")
+            A = self.connect_graph(A)
+        return torch.from_numpy(A), knn
+
+    @property
+    def A(self):
+        return self._A
+
+    @A.setter
+    def A(self, A: torch.Tensor):
+        # This can be usefull in a graph settings where the
+        # connectivity matrix comes from elsewhere and we just
+        # want to fill in the weights with our metric
+        self._A = A
+        self.weakly_connected = is_connected(Graph(A.cpu().numpy()))
+        if not self.weakly_connected:
+            self._A = self.connect_graph(A)
+
+    @torch.no_grad()
+    def compute_weights(
+        self, A: torch.Tensor, data: torch.Tensor, b_size: int = 64
+    ) -> torch.Tensor:
+        """
+        Given the adjecency matrix, fills it using the metric.
+
+        Parameters:
+        A : torch.Tensor (n,n)
+            Connectivity matrix
+        data : torch.Tensor (n,d)
+            The data points
+        b_size: int
+            The batch size for parallel processing
+
+        Returns
+        W : torch.Tensor (n,n)
+            The weighted adjacency matrix where W[i,j] approx dst(x_i,x_j)
+        """
+        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(1, 1, -1, 1)
+        N_data = data.shape[0]
+        W = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
 
         pbar = tqdm(
             range(0, N_data, b_size),
             desc="Initialize Graph",
             unit="batch",
         )
-        with torch.no_grad():
-            for start in pbar:
-                end = min(start + b_size, N_data)
-                batch_idx = torch.arange(start, end)
-                curr_idx = indices[batch_idx]  # (b_size, k)
-                # Sometimes the batch indices amounts to only one
-                # To ensure the dimension is correct, we unsqueeze the batch dimension in that case
-                # This is just because numpy (or me idk) sucks and doesn't keep dim
-                if curr_idx.ndim == 1:
-                    curr_idx = curr_idx[None, :]  # (1,k)
+        for start in pbar:
+            end = min(start + b_size, N_data)
+            batch_idx = torch.arange(start, end)
+            curr_idx = A[batch_idx].nonzero(as_tuple=False)[:, 1].view(batch_idx.shape[0], -1)
 
-                p_i = data[batch_idx][:, None, None, :]
-                p_j = data[curr_idx][:, :, None, :]
+            p_i = data[batch_idx][:, None, None, :]
+            p_j = data[curr_idx][:, :, None, :]
 
-                linear_traj = p_i + t * (p_j - p_i)  # (b_size, k, T, d)
-                linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
-                curve_length = self.compute_distance(linear_traj)
-                curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
-                Weight_matrix[batch_idx.view(-1, 1), curr_idx] = curve_length
-                Weight_matrix[curr_idx, batch_idx.view(-1, 1)] = curve_length
+            linear_traj = p_i + t * (p_j - p_i)  # (b_size, k, T, d)
+            linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
+            curve_length = self.compute_distance(linear_traj)
+            curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
+            W[batch_idx.view(-1, 1), curr_idx] = curve_length
+            W[curr_idx, batch_idx.view(-1, 1)] = curve_length
 
-        # Move to cpu to gain back memory if on gpu
-        # just to do this operation
-        Weight_matrix = Weight_matrix.cpu()
-        # Make the weight matrix symmetric
-        W = 0.5 * (Weight_matrix + Weight_matrix.T)
-        W = W.to(device=data.device, dtype=data.dtype)
+        W = W.to(device="cpu")
 
-        self.weakly_connected = is_connected(Graph(W.cpu().numpy()))
-        if not self.weakly_connected:
-            W = self.connect_graph(W)
-        return W.to("cpu"), knn
+        assert is_connected(
+            Graph(W.numpy())
+        ), "The graph is not connected after computing the weights. This should not happen."
+        return W
 
-    def get_cc_connections_idx(self, W, X):
+    def get_cc_connections_idx(self, A, X):
         """
-        Given the adjacency matrix W and the data points X,
+        Given the adjacency matrix A and the data points X,
         returns the indices of the connections between the connected components.
 
         Parameters:
-        W (torch.Tensor): Adjacency matrix of shape (n, n).
+        A (torch.Tensor): Adjacency matrix of shape (n, n).
         X (torch.Tensor): Data points of shape (n, d).
 
         Returns:
@@ -1056,7 +1082,7 @@ class SolverGraph(GeodesicDistanceSolver):
             closest component.
         """
         # Get connected components from the adjacency matrix W
-        G = Graph(W.cpu().numpy())
+        G = Graph(A.cpu().numpy())
         cc_list = []
         for c in nx.connected_components(G):
             cc_list.append(torch.tensor(list(c)))
@@ -1085,23 +1111,34 @@ class SolverGraph(GeodesicDistanceSolver):
             idx_correspondence[i, 1] = idx_j
         return idx_correspondence
 
-    def connect_graph(self, W: torch.Tensor) -> torch.Tensor:
+    def connect_graph(self, A: torch.Tensor) -> torch.Tensor:
         """
         Connect the connected components of the graph by adding dummy edges.
         This is a workaround to ensure that the graph is connected.
         The cc are connected via their closest points according to euclidean distance.
-        """
-        idx_correspondence = self.get_cc_connections_idx(W, self.data)
-        a = self.data[idx_correspondence]
-        t = torch.arange(0, 1, self.dt, device=self.data.device, dtype=W.dtype).view(1, -1, 1)
 
-        p_i = a[:, 0][:, None, :]
-        p_j = a[:, 1][:, None, :]
-        linear_traj = p_i + t * (p_j - p_i)  # (n_cc,T,d)
-        dst = self.compute_distance(linear_traj).to(W.dtype)
-        W[idx_correspondence[:, 0], idx_correspondence[:, 1]] = dst
-        W[idx_correspondence[:, 1], idx_correspondence[:, 0]] = dst
-        return W
+        Parameters:
+        A (torch.Tensor):
+            Adjacency matrix of shape (n, n).
+
+        Returns:
+        A (torch.Tensor):
+            Adjacency matrix of shape (n, n) with added edges to connect the connected components.
+        """
+        idx_correspondence = self.get_cc_connections_idx(A, self.data)
+        # a = self.data[idx_correspondence]
+        # t = torch.arange(0, 1, self.dt, device=self.data.device, dtype=W.dtype).view(1, -1, 1)
+
+        # p_i = a[:, 0][:, None, :]
+        # p_j = a[:, 1][:, None, :]
+        # linear_traj = p_i + t * (p_j - p_i)  # (n_cc,T,d)
+        # dst = self.compute_distance(linear_traj).to(W.dtype)
+        # W[idx_correspondence[:, 0], idx_correspondence[:, 1]] = dst
+        # W[idx_correspondence[:, 1], idx_correspondence[:, 0]] = dst
+        A[idx_correspondence[:, 0], idx_correspondence[:, 1]] = 1
+        A[idx_correspondence[:, 1], idx_correspondence[:, 0]] = 1
+        return A
+        # return W
 
     def get_similarity_matrix(self, W, sigma=1):
         """Compute the similarity matrix using the weight matrix W
