@@ -1016,7 +1016,7 @@ class SolverGraph(GeodesicDistanceSolver):
         if not self.weakly_connected:
             self._A = self.connect_graph(A)
         self.W = self.compute_weights(self._A, self.data, self.b_size)
-        
+        self.predecessors = self.get_predecessors(self.W)
 
     @torch.no_grad()
     def compute_weights(
