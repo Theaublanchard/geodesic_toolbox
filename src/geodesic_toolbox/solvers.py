@@ -1062,6 +1062,7 @@ class SolverGraph(GeodesicDistanceSolver):
             W[curr_idx, batch_idx.view(-1, 1)] = curve_length
 
         W = W.to(device="cpu")
+        W = 1 / 2 * (W + W.T)  # Ensure symmetry
 
         assert is_connected(
             Graph(W.numpy())
@@ -1634,6 +1635,7 @@ def dst_mat_vectorized(
     return distances
 
 
+# @TODO: adapt to use the same method as the other one.
 class SolverGraphFinsler(torch.nn.Module):
     """Computes the geodesic distances between points using a KNN-graph
     for metrics from a Finsler space.
@@ -1682,84 +1684,188 @@ class SolverGraphFinsler(torch.nn.Module):
         self.b_size = batch_size
         self.smooth_curve = smooth_curve
 
-        self.W, self.knn = self.init_knn_graph(data, n_neighbors, batch_size)
-        self.predecessors = self.get_predecessors()
+        # self.W, self.knn = self.init_knn_graph(data, n_neighbors, batch_size)
+        # self.predecessors = self.get_predecessors()
 
-    @torch.no_grad()
-    def init_knn_graph(
-        self, data: torch.Tensor, n_neighbors: int, b_size: int = 64
-    ) -> tuple[np.ndarray, NearestNeighbors]:
-        """Initialize the graph using a KNN graph.
+        self._A, self.knn = self.compute_connectivity_matrix(data, n_neighbors)
+        self.W = self.compute_weights(self._A, data, batch_size)
 
-        Parameters
-        ----------
-        data : torch.Tensor (N,D)
-            The data points
-        n_neighbors : int
-            The number of neighbors to use
-        b_size : int
-            The size of the batch to use for the computation
+        self.predecessors = self.get_predecessors(self.W)
 
-        Returns
-        -------
-        W : torch.Tensor (N,N)
-            The weight matrix of the graph
-        knn : NearestNeighbors
-            The KNN object
+    def compute_connectivity_matrix(self, data: torch.Tensor, n_neighbors: int):
         """
-        # We add one to the number of neighbors to remove the point itself
-        knn = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm="ball_tree")
+        Compute the connectivity matrix from the graph.
+        If the graph is not weakly connected, we connect the different components by adding edges between the closest points of the different components.
+
+        Parameters:
+        data : torch.Tensor (N,D)
+            The data points to use to compute the graph
+        n_neighbors : int
+            The number of neighbors to use for the KNN graph
+
+        Returns:
+        A : torch.Tensor (N,N)
+            The adjacency matrix of the graph
+        knn : NearestNeighbors
+            The KNN object used for inference
+        """
+        # Maybe radius graph is better ?
+        knn = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm="ball_tree", n_jobs=-1)
         knn.fit(data.cpu())
-        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(
-            1, 1, -1, 1
-        )  # (1,1,T,1)
 
         # Find the Euclidean kNN
         N_data = data.shape[0]
         _, indices = knn.kneighbors(data.cpu())
-        indices = indices[:, 1:]  # Remove the point itself
-        Weight_matrix = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
+        indices = indices[:, 1:]  # Remove the point itself, (N_data, k)
+        A = np.zeros((N_data, N_data), dtype=int)
+        batch_idx = torch.arange(N_data).view(-1, 1)
+        A[batch_idx, indices] = 1
+        if not is_connected(Graph(A)):
+            print("Adjacency Graph is not connected : connecting ")
+            A = self.connect_graph(A)
+        return torch.from_numpy(A), knn
+
+    @property
+    def A(self):
+        return self._A
+
+    @A.setter
+    def A(self, A: torch.Tensor):
+        # This can be usefull in a graph settings where the
+        # connectivity matrix comes from elsewhere and we just
+        # want to fill in the weights with our metric
+        # We expect the data to come from the same place with the same ordering
+        self._A = A
+        self.weakly_connected = is_connected(Graph(A.cpu().numpy()))
+        if not self.weakly_connected:
+            self._A = self.connect_graph(A)
+        self.W = self.compute_weights(self._A, self.data, self.b_size)
+        self.predecessors = self.get_predecessors(self.W)
+
+    @torch.no_grad()
+    def compute_weights(
+        self, A: torch.Tensor, data: torch.Tensor, b_size: int = 64
+    ) -> torch.Tensor:
+        """
+        Given the adjecency matrix, fills it using the metric.
+
+        Parameters:
+        A : torch.Tensor (n,n)
+            Connectivity matrix
+        data : torch.Tensor (n,d)
+            The data points
+        b_size: int
+            The batch size for parallel processing
+
+        Returns
+        W : torch.Tensor (n,n)
+            The weighted adjacency matrix where W[i,j] approx dst(x_i,x_j)
+        """
+        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(1, 1, -1, 1)
+        N_data = data.shape[0]
+        W = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
 
         pbar = tqdm(
-            range(0, N_data, self.b_size),
+            range(0, N_data, b_size),
             desc="Initialize Graph",
             unit="batch",
         )
-        with torch.no_grad():
-            for start in pbar:
-                end = min(start + b_size, N_data)
-                batch_idx = torch.arange(start, end)  # (b,)
-                curr_idx = indices[batch_idx]  # (b,k)
-                # Sometimes the batch indices amounts to only one
-                # To ensure the dimension is correct, we unsqueeze the batch dimension in that case
-                # This is just because numpy (or me idk) sucks and doesn't keep dim
-                if curr_idx.ndim == 1:
-                    curr_idx = curr_idx[None, :]  # (1,k)
+        for start in pbar:
+            end = min(start + b_size, N_data)
+            batch_idx = torch.arange(start, end)
+            curr_idx = A[batch_idx].nonzero(as_tuple=False)[:, 1].view(batch_idx.shape[0], -1)
 
-                p_i = data[batch_idx][:, None, None, :]  # (b,1,1,d)
-                p_j = data[curr_idx][:, :, None, :]  # (b,k,1,d)
+            p_i = data[batch_idx][:, None, None, :]
+            p_j = data[curr_idx][:, :, None, :]
 
-                linear_traj = p_i + t * (p_j - p_i)  # (b,k,T,d)
-                tangent_vectors = p_j - p_i
-                tangent_vectors = tangent_vectors.expand(-1, -1, self.T, -1)
-                linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
-                tangent_vectors = rearrange(tangent_vectors, "b k T d -> (b k) T d")
-                curve_length = self.compute_distance(linear_traj, tangent_vectors)
+            linear_traj = p_i + t * (p_j - p_i)  # (b_size, k, T, d)
+            linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
+            curve_length = self.compute_distance(linear_traj)
+            curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
+            W[batch_idx.view(-1, 1), curr_idx] = curve_length
 
-                curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
-                Weight_matrix[batch_idx.view(-1, 1), curr_idx] = curve_length
+        W = W.to(device="cpu")
 
-        if not is_strongly_connected(DiGraph(Weight_matrix.cpu().numpy())):
-            Weight_matrix = self.connect_graph(Weight_matrix)
-        return Weight_matrix.to("cpu"), knn
+        assert is_strongly_connected(
+            DiGraph(W.numpy())
+        ), "The graph is not connected after computing the weights. This should not happen."
+        return W
 
-    def get_cc_connections_idx(self, W, X):
+    # @torch.no_grad()
+    # def init_knn_graph(
+    #     self, data: torch.Tensor, n_neighbors: int, b_size: int = 64
+    # ) -> tuple[np.ndarray, NearestNeighbors]:
+    #     """Initialize the graph using a KNN graph.
+
+    #     Parameters
+    #     ----------
+    #     data : torch.Tensor (N,D)
+    #         The data points
+    #     n_neighbors : int
+    #         The number of neighbors to use
+    #     b_size : int
+    #         The size of the batch to use for the computation
+
+    #     Returns
+    #     -------
+    #     W : torch.Tensor (N,N)
+    #         The weight matrix of the graph
+    #     knn : NearestNeighbors
+    #         The KNN object
+    #     """
+    #     # We add one to the number of neighbors to remove the point itself
+    #     knn = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm="ball_tree")
+    #     knn.fit(data.cpu())
+    #     t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(
+    #         1, 1, -1, 1
+    #     )  # (1,1,T,1)
+
+    #     # Find the Euclidean kNN
+    #     N_data = data.shape[0]
+    #     _, indices = knn.kneighbors(data.cpu())
+    #     indices = indices[:, 1:]  # Remove the point itself
+    #     Weight_matrix = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
+
+    #     pbar = tqdm(
+    #         range(0, N_data, self.b_size),
+    #         desc="Initialize Graph",
+    #         unit="batch",
+    #     )
+    #     with torch.no_grad():
+    #         for start in pbar:
+    #             end = min(start + b_size, N_data)
+    #             batch_idx = torch.arange(start, end)  # (b,)
+    #             curr_idx = indices[batch_idx]  # (b,k)
+    #             # Sometimes the batch indices amounts to only one
+    #             # To ensure the dimension is correct, we unsqueeze the batch dimension in that case
+    #             # This is just because numpy (or me idk) sucks and doesn't keep dim
+    #             if curr_idx.ndim == 1:
+    #                 curr_idx = curr_idx[None, :]  # (1,k)
+
+    #             p_i = data[batch_idx][:, None, None, :]  # (b,1,1,d)
+    #             p_j = data[curr_idx][:, :, None, :]  # (b,k,1,d)
+
+    #             linear_traj = p_i + t * (p_j - p_i)  # (b,k,T,d)
+    #             tangent_vectors = p_j - p_i
+    #             tangent_vectors = tangent_vectors.expand(-1, -1, self.T, -1)
+    #             linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
+    #             tangent_vectors = rearrange(tangent_vectors, "b k T d -> (b k) T d")
+    #             curve_length = self.compute_distance(linear_traj, tangent_vectors)
+
+    #             curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
+    #             Weight_matrix[batch_idx.view(-1, 1), curr_idx] = curve_length
+
+    #     if not is_strongly_connected(DiGraph(Weight_matrix.cpu().numpy())):
+    #         Weight_matrix = self.connect_graph(Weight_matrix)
+    #     return Weight_matrix.to("cpu"), knn
+
+    def get_cc_connections_idx(self, A, X):
         """
-        Given the adjacency matrix W and the data points X,
+        Given the adjacency matrix A and the data points X,
         returns the indices of the connections between the connected components.
 
         Parameters:
-        W (torch.Tensor): Adjacency matrix of shape (n, n).
+        A (torch.Tensor): Adjacency matrix of shape (n, n).
         X (torch.Tensor): Data points of shape (n, d).
 
         Returns:
@@ -1769,8 +1875,8 @@ class SolverGraphFinsler(torch.nn.Module):
             and idx_correspondence[i, 1] is the index of the second point connecting the i-th component to its
             closest component.
         """
-        # Get connected components from the adjacency matrix W
-        G = DiGraph(W.cpu().numpy())
+        # Get connected components from the adjacency matrix A
+        G = DiGraph(A.cpu().numpy())
         cc_list = []
         for c in nx.strongly_connected_components(G):
             cc_list.append(torch.tensor(list(c)))
@@ -1799,27 +1905,29 @@ class SolverGraphFinsler(torch.nn.Module):
             idx_correspondence[i, 1] = idx_j
         return idx_correspondence
 
-    def connect_graph(self, W) -> torch.Tensor:
+    def connect_graph(self, A: torch.Tensor) -> torch.Tensor:
         """
         Connect the connected components of the graph by adding dummy edges.
         This is a workaround to ensure that the graph is connected.
         The cc are connected via their closest points according to euclidean distance.
+
+        Parameters:
+        A (torch.Tensor):
+            Adjacency matrix of shape (n, n).
+
+        Returns:
+        A (torch.Tensor):
+            Adjacency matrix of shape (n, n) with added edges to connect the connected components.
         """
-        idx_correspondence = self.get_cc_connections_idx(W, self.data)
+        idx_correspondence = self.get_cc_connections_idx(A, self.data)
         a = self.data[idx_correspondence]
         t = torch.arange(0, 1, self.dt, device=self.data.device, dtype=self.data.dtype).view(
             1, -1, 1
         )
 
-        p_i = a[:, 0][:, None, :]  # (n_cc,1,d)
-        p_j = a[:, 1][:, None, :]  # (n_cc,1,d)
-        linear_traj = p_i + t * (p_j - p_i)  # (n_cc,T,d)
-        tangent_vectors = (p_j - p_i).expand(-1, linear_traj.shape[1], -1)  # (n_cc,T,d)
-        dst_forward = self.compute_distance(linear_traj, tangent_vectors)
-        dst_backward = self.compute_distance(linear_traj.flip(1), -tangent_vectors)
-        W[idx_correspondence[:, 0], idx_correspondence[:, 1]] = dst_forward
-        W[idx_correspondence[:, 1], idx_correspondence[:, 0]] = dst_backward
-        return W
+        A[idx_correspondence[:, 0], idx_correspondence[:, 1]] = 1
+        A[idx_correspondence[:, 1], idx_correspondence[:, 0]] = 1
+        return A
 
     def compute_distance(self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None):
         """Given a trajectory and the tangent vectors, compute the distance
@@ -1866,11 +1974,11 @@ class SolverGraphFinsler(torch.nn.Module):
         S = torch.exp(-W / (2 * sigma**2))
         return S
 
-    def get_predecessors(self) -> torch.Tensor:
+    def get_predecessors(self,W) -> torch.Tensor:
         """Get the predecessors for the shortest path computation..."""
         print("Computing predecessors...")
         dst_matrix, predecessors = shortest_path(
-            csr_matrix(self.W.cpu().numpy()),
+            csr_matrix(W.cpu().numpy()),
             directed=True,
             return_predecessors=True,
         )
