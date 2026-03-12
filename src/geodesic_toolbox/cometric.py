@@ -1804,3 +1804,165 @@ class RandersMetrics(FinslerMetric):
             Inverse of the fundamental tensor of the Randers metric at x in the direction of v
         """
         return self.inv_fund_tensor_analytic_(x, v)
+
+
+class _DualOmegaWrapper(nn.Module):
+    """Wrapper module that computes dual 1-form on-the-fly when called by parent class methods."""
+
+    def __init__(self, dual_randers_instance):
+        super().__init__()
+        self.dual_randers = dual_randers_instance
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.dual_randers.omega_star(x)
+
+
+class _DualCometricWrapper(CoMetric):
+    """Wrapper cometric that computes dual metric tensor on-the-fly when called by parent class methods."""
+
+    def __init__(self, dual_randers_instance):
+        super().__init__()
+        self.dual_randers = dual_randers_instance
+        self.is_diag = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Returns the inverse of the dual metric tensor (the dual cometric)."""
+        G_star = self.dual_randers.G_star(x)
+        return torch.linalg.inv(G_star)
+
+    def metric_tensor(self, x: Tensor) -> Tensor:
+        """Returns the dual metric tensor."""
+        return self.dual_randers.G_star(x)
+
+
+class DualRandersMetrics(RandersMetrics):
+    """
+    Dual Randers metric class. The dual Randers metric is defined as F*(x,p) = sup_{v} (p.v - F(x,v))
+    where F is the primal Randers metric.
+
+    Tips : Use the parameter beta of the Randers metric to be absolutely sure that
+    the primal Randers metric is positive.
+
+    Parameters:
+    -----------
+    randers_metric : RandersMetrics
+        The primal Randers metric to dualize.
+    epsilon : float
+        Small regularization parameter to allow for better differentiability.
+        Hence we have F_star_eps(x,v) = sqrt(F_star(x,v)^2 + epsilon^2)
+    """
+
+    def __init__(self, randers_metric: RandersMetrics, epsilon: float = 1e-8):
+        super(DualRandersMetrics, self).__init__(
+            base_cometric=randers_metric.base_cometric,
+            omega=randers_metric.omega,
+            beta=1.0,
+        )
+        self.primal_randers = randers_metric
+        self.omega = _DualOmegaWrapper(self)
+        self.base_cometric = _DualCometricWrapper(self)
+        self.beta = 1.0
+        self.epsilon = epsilon
+
+    def omega_star(self, x: Tensor) -> Tensor:
+        """
+        Compute the dual 1-form omega* at point x.
+
+        Parameters:
+        ----------
+        x : Tensor (b,d)
+            Points in the manifold
+
+        Returns:
+        -------
+        omega_star : Tensor (b,d)
+            Dual 1-form at point x
+        """
+        omega = self.primal_randers.beta * self.primal_randers.omega(x)  # (b,d)
+        G_inv = self.primal_randers.base_cometric.cometric_tensor(x)  # (b,d,d) | (b,d)
+
+        if self.primal_randers.base_cometric.is_diag:
+            G_inv_w = G_inv * omega
+        else:
+            G_inv_w = torch.einsum("bij,bj->bi", G_inv, omega)  # (b,d)
+
+        alpha = 1 - torch.einsum("bi,bi->b", omega, G_inv_w)  # (b,)
+
+        omega_star = -1 / alpha[:, None] * G_inv_w  # (b,d)
+        return omega_star
+
+    def G_star(self, x: Tensor) -> Tensor:
+        """
+        Compute the dual metric tensor G* at point x.
+
+        Parameters:
+        ----------
+        x : Tensor (b,d)
+            Points in the manifold
+
+        Returns:
+        G_star : Tensor (b,d,d)
+            Dual metric tensor at point x
+        """
+        omega = self.primal_randers.beta * self.primal_randers.omega(x)  # (b,d)
+        G_inv = self.primal_randers.base_cometric.cometric_tensor(x)  # (b,d,d) | (b,d)
+
+        if self.primal_randers.base_cometric.is_diag:
+            G_inv_w = G_inv * omega  # (b,d)
+        else:
+            G_inv_w = torch.einsum("bij,bj->bi", G_inv, omega)  # (b,d)
+
+        alpha = 1 - torch.einsum("bi,bi->b", omega, G_inv_w)  # (b,)
+
+        G_star = torch.einsum("bi,bj->bij", G_inv_w, G_inv_w)  # (b,d,d)
+        if self.primal_randers.base_cometric.is_diag:
+            alpha_G_inv = alpha[:, None] * G_inv  # (b,d)
+            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]  # (b,d,d)
+        else:
+            alpha_G_inv = alpha[:, None, None] * G_inv  # (b,d,d)
+            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]  # (b,d,d)
+        return G_star
+
+    def forward(self, x: Tensor, v: Tensor) -> Tensor:
+        """
+        Compute the dual Randers metric F*(x,v) = sup_{b} <b,v> with F(x,b) <= 1.
+
+        The expression is extracted from http://arxiv.org/abs/2404.03999.
+
+        Parameters:
+        ----------
+        x : Tensor (b,d)
+            Points in the manifold
+        v : Tensor (b,d)
+            Tangent vectors at x
+
+        Returns:
+        -------
+        F_star : Tensor (b,)
+            Dual Randers metric values at (x,v)
+        """
+        omega = self.primal_randers.beta * self.primal_randers.omega(x)  # (b,d)
+        G_inv = self.primal_randers.base_cometric.cometric_tensor(x)  # (b,d,d) | (b,d)
+
+        if self.primal_randers.base_cometric.is_diag:
+            G_inv_w = G_inv * omega  # (b,d)
+        else:
+            G_inv_w = torch.einsum("bij,bj->bi", G_inv, omega)  # (b,d)
+
+        alpha = 1 - torch.einsum("bi,bi->b", omega, G_inv_w)  # (b,)
+
+        omega_star = -1 / alpha[:, None] * G_inv_w  # (b,d)
+
+        G_star = torch.einsum("bi,bj->bij", G_inv_w, G_inv_w)  # (b,d,d)
+        if self.primal_randers.base_cometric.is_diag:
+            alpha_G_inv = alpha[:, None] * G_inv  # (b,d)
+            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]  # (b,d,d)
+        else:
+            alpha_G_inv = alpha[:, None, None] * G_inv  # (b,d,d)
+            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]  # (b,d,d)
+
+        v_norm = torch.einsum("bi,bij,bj->b", v, G_star, v).sqrt()  # (b,)
+        omega_star_v = torch.einsum("bi,bi->b", omega_star, v)  # (b,)
+        F_star = v_norm + omega_star_v  # (b,)
+        reg_F_star = torch.sqrt(F_star**2 + self.epsilon**2)  # (b,)
+        return reg_F_star
