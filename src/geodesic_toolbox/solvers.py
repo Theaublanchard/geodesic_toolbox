@@ -1005,12 +1005,13 @@ class SolverGraph(GeodesicDistanceSolver):
     def A(self):
         return self._A
 
-    @A.setter
-    def A(self, A: torch.Tensor):
-        # This can be usefull in a graph settings where the
-        # connectivity matrix comes from elsewhere and we just
-        # want to fill in the weights with our metric
-        # We expect the data to come from the same place with the same ordering
+    def load_adjacency_matrix(self, A: torch.Tensor):
+        """
+        This can be usefull in a graph settings where the
+        connectivity matrix comes from elsewhere and we just
+        want to fill in the weights with our metric
+        We expect the data to come from the same place with the same ordering
+        """
         self._A = A
         self.weakly_connected = is_connected(Graph(A.cpu().numpy()))
         if not self.weakly_connected:
@@ -1635,7 +1636,6 @@ def dst_mat_vectorized(
     return distances
 
 
-# @TODO: adapt to use the same method as the other one.
 class SolverGraphFinsler(torch.nn.Module):
     """Computes the geodesic distances between points using a KNN-graph
     for metrics from a Finsler space.
@@ -1728,13 +1728,16 @@ class SolverGraphFinsler(torch.nn.Module):
     @property
     def A(self):
         return self._A
+    
+    def load_adjacency_matrix(self, A: torch.Tensor):
+        """Load an adjacency matrix from an external source and compute the weights and predecessors.
+        This can be useful in a graph settings where the connectivity matrix comes from elsewhere and we just
+        want to fill in the weights with our metric. We expect the data to come from the same place with the same ordering.
 
-    @A.setter
-    def A(self, A: torch.Tensor):
-        # This can be usefull in a graph settings where the
-        # connectivity matrix comes from elsewhere and we just
-        # want to fill in the weights with our metric
-        # We expect the data to come from the same place with the same ordering
+        Parameters:
+        A : torch.Tensor (n,n)
+            The adjacency matrix to load
+        """
         self._A = A
         self.weakly_connected = is_connected(Graph(A.cpu().numpy()))
         if not self.weakly_connected:
