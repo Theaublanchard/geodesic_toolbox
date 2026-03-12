@@ -1000,15 +1000,22 @@ class SolverGraph(GeodesicDistanceSolver):
         indices = indices[:, 1:]  # Remove the point itself, (N_data, k)
         # Weight_matrix = np.zeros((N_data, N_data))
         Weight_matrix = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
-        num_batches = (N_data + b_size - 1) // b_size
 
-        pbar = tqdm(range(num_batches), desc="Initialize Graph", unit="batch")
+        pbar = tqdm(
+            range(0, N_data, b_size),
+            desc="Initialize Graph",
+            unit="batch",
+        )
         with torch.no_grad():
-            for batch_idx in pbar:
-                start = batch_idx * b_size
+            for start in pbar:
                 end = min(start + b_size, N_data)
                 batch_idx = torch.arange(start, end)
                 curr_idx = indices[batch_idx]  # (b_size, k)
+                # Sometimes the batch indices amounts to only one
+                # To ensure the dimension is correct, we unsqueeze the batch dimension in that case
+                # This is just because numpy (or me idk) sucks and doesn't keep dim
+                if curr_idx.ndim == 1:
+                    curr_idx = curr_idx[None, :]  # (1,k)
 
                 p_i = data[batch_idx][:, None, None, :]
                 p_j = data[curr_idx][:, :, None, :]
@@ -1470,7 +1477,7 @@ def dst_mat(a: Tensor, b: Tensor, dst_func: GeodesicDistanceSolver) -> Tensor:
     dst = torch.zeros(B, B, device=a.device)
 
     # row wise filling
-    for i in range(B):
+    for i in tqdm(range(B), desc="Computing distance matrix", unit="row"):
         a_batch = a[i].unsqueeze(0).expand(B, -1)
         distances = dst_func(a_batch, b)
         dst[i] = distances
@@ -1671,18 +1678,23 @@ class SolverGraphFinsler(torch.nn.Module):
         N_data = data.shape[0]
         _, indices = knn.kneighbors(data.cpu())
         indices = indices[:, 1:]  # Remove the point itself
-        # Weight_matrix = np.zeros((N_data, N_data))
         Weight_matrix = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
 
-        num_batches = (N_data + b_size - 1) // b_size
-
-        pbar = tqdm(range(num_batches), desc="Initialize Graph", unit="batch")
+        pbar = tqdm(
+            range(0, N_data, self.b_size),
+            desc="Initialize Graph",
+            unit="batch",
+        )
         with torch.no_grad():
-            for batch_idx in pbar:
-                start = batch_idx * b_size
+            for start in pbar:
                 end = min(start + b_size, N_data)
                 batch_idx = torch.arange(start, end)  # (b,)
                 curr_idx = indices[batch_idx]  # (b,k)
+                # Sometimes the batch indices amounts to only one
+                # To ensure the dimension is correct, we unsqueeze the batch dimension in that case
+                # This is just because numpy (or me idk) sucks and doesn't keep dim
+                if curr_idx.ndim == 1:
+                    curr_idx = curr_idx[None, :]  # (1,k)
 
                 p_i = data[batch_idx][:, None, None, :]  # (b,1,1,d)
                 p_j = data[curr_idx][:, :, None, :]  # (b,k,1,d)
@@ -2274,9 +2286,7 @@ class GEORCE(GeodesicDistanceSolver):
 
         # Evaluate new energy without building a graph (Armijo condition only)
         with torch.no_grad():
-            x_t_new = x_0 + torch.cumsum(
-                alpha * u_t[:-1] + (1 - alpha) * u_t_i[:-1], dim=0
-            )
+            x_t_new = x_0 + torch.cumsum(alpha * u_t[:-1] + (1 - alpha) * u_t_i[:-1], dim=0)
             E_new = self.compute_energy(x_t_new, x_0, x_T)
 
         # Compute Armijo's condition
@@ -2797,9 +2807,7 @@ class GEORCEFinsler(torch.nn.Module):
 
         # Evaluate candidate energies without building a graph (Armijo condition only)
         with torch.no_grad():
-            x_t_new = x_0 + torch.cumsum(
-                alpha * u_t[:-1] + (1 - alpha) * u_t_i[:-1], dim=0
-            )
+            x_t_new = x_0 + torch.cumsum(alpha * u_t[:-1] + (1 - alpha) * u_t_i[:-1], dim=0)
             E_new = self.compute_energy(x_t_new, x_0, x_T)
 
         # Compute Armijo's condition
@@ -2901,9 +2909,9 @@ class GEORCEFinsler(torch.nn.Module):
 
         # Precompute fundamental tensor at start without building graph
         with torch.no_grad():
-            G_0 = self.finsler.fundamental_tensor(x_0[None, :], u_t_i[0, :].unsqueeze(0)).squeeze(
-                0
-            )
+            G_0 = self.finsler.fundamental_tensor(
+                x_0[None, :], u_t_i[0, :].unsqueeze(0)
+            ).squeeze(0)
 
         # L4
         grad_E_t = torch.autograd.grad(
