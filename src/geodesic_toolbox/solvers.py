@@ -1010,10 +1010,13 @@ class SolverGraph(GeodesicDistanceSolver):
         # This can be usefull in a graph settings where the
         # connectivity matrix comes from elsewhere and we just
         # want to fill in the weights with our metric
+        # We expect the data to come from the same place with the same ordering
         self._A = A
         self.weakly_connected = is_connected(Graph(A.cpu().numpy()))
         if not self.weakly_connected:
             self._A = self.connect_graph(A)
+        self.W = self.compute_weights(self._A, self.data, self.b_size)
+        
 
     @torch.no_grad()
     def compute_weights(
