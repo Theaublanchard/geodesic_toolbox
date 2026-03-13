@@ -27,6 +27,86 @@ from tqdm import tqdm
 from torchdiffeq import odeint
 
 
+def _get_padded_neighbor_indices(
+    edge_idx: Tensor,
+    batch_size: int,
+    target_width: int | None = None,
+    pad_value: int = 0,
+) -> Tensor:
+    """
+    Pad a nonzero index list so each row has the same number of neighbors.
+
+    Example with target_width=4 and pad_value=0:
+    input edge_idx:
+    tensor([[0, 1],
+            [0, 12],
+            [1, 4],
+            [1, 5],
+            [1, 65]])
+
+    output padded_edge_idx:
+    tensor([[0, 1],
+            [0, 12],
+            [0, 0],
+            [0, 0],
+            [1, 4],
+            [1, 5],
+            [1, 65],
+            [1, 0]])
+
+    Parameters:
+    edge_idx : Tensor (n_edges, 2)
+        Output of nonzero(as_tuple=False) on a batch of adjacency rows.
+        Column 0 is the row id inside the batch, column 1 is the neighbor id.
+    batch_size : int
+        Number of rows in the adjacency batch.
+    target_width : int, optional
+        If provided, each row is padded to at least target_width entries.
+        If some row has more neighbors than target_width, width is increased automatically.
+    pad_value : int, optional
+        Value used for padded neighbor ids.
+
+    Returns:
+    padded_edge_idx : Tensor (batch_size * width, 2)
+        Padded pair representation [row_in_batch, neighbor_id].
+        It can be reshaped back to (batch_size, width) by taking column 1.
+    """
+    if edge_idx.numel() == 0:
+        counts = torch.zeros(batch_size, dtype=torch.long, device=edge_idx.device)
+    else:
+        counts = torch.bincount(edge_idx[:, 0], minlength=batch_size)
+
+    width = int(counts.max().item()) if counts.numel() > 0 else 0
+    if target_width is not None:
+        width = max(width, target_width)
+
+    padded_edge_idx = torch.full(
+        (batch_size * width, 2),
+        pad_value,
+        device=edge_idx.device,
+        dtype=torch.long,
+    )
+
+    row_template = (
+        torch.arange(batch_size, device=edge_idx.device, dtype=torch.long)
+        .unsqueeze(1)
+        .expand(-1, width)
+        .reshape(-1)
+    )
+    padded_edge_idx[:, 0] = row_template
+
+    if edge_idx.numel() == 0 or width == 0:
+        return padded_edge_idx
+
+    row_offsets = torch.cat([counts.new_zeros(1), counts.cumsum(dim=0)[:-1]])
+    slot_idx = torch.arange(edge_idx.shape[0], device=edge_idx.device, dtype=torch.long)
+    slot_idx = slot_idx - row_offsets.repeat_interleave(counts)
+
+    flat_pos = edge_idx[:, 0] * width + slot_idx
+    padded_edge_idx[flat_pos, 1] = edge_idx[:, 1]
+    return padded_edge_idx
+
+
 class GeodesicDistanceSolver(torch.nn.Module):
     """Base class for geodesic distance solvers."""
 
@@ -1050,7 +1130,16 @@ class SolverGraph(GeodesicDistanceSolver):
         for start in pbar:
             end = min(start + b_size, N_data)
             batch_idx = torch.arange(start, end)
-            curr_idx = A[batch_idx].nonzero(as_tuple=False)[:, 1].view(batch_idx.shape[0], -1)
+            edge_idx = A[batch_idx].nonzero(as_tuple=False)
+            # When using a loaded A matrix, there can be a different number of neighbors for each point,
+            # so we need to pad the edge_idx to have a fixed number of neighbors for each point
+            padded_edge_idx = _get_padded_neighbor_indices(
+                edge_idx,
+                batch_size=batch_idx.shape[0],
+                target_width=self.n_neighbors,
+                pad_value=0,
+            )
+            curr_idx = padded_edge_idx[:, 1].view(batch_idx.shape[0], -1)
 
             p_i = data[batch_idx][:, None, None, :]
             p_j = data[curr_idx][:, :, None, :]
@@ -1061,6 +1150,9 @@ class SolverGraph(GeodesicDistanceSolver):
             curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
             W[batch_idx.view(-1, 1), curr_idx] = curve_length
             W[curr_idx, batch_idx.view(-1, 1)] = curve_length
+
+        # Remove padded assignments introduced by variable-degree batches.
+        W = W * A.to(device=W.device, dtype=W.dtype)
 
         W = W.to(device="cpu")
         W = 1 / 2 * (W + W.T)  # Ensure symmetry
@@ -1728,7 +1820,7 @@ class SolverGraphFinsler(torch.nn.Module):
     @property
     def A(self):
         return self._A
-    
+
     def load_adjacency_matrix(self, A: torch.Tensor):
         """Load an adjacency matrix from an external source and compute the weights and predecessors.
         This can be useful in a graph settings where the connectivity matrix comes from elsewhere and we just
@@ -1738,12 +1830,17 @@ class SolverGraphFinsler(torch.nn.Module):
         A : torch.Tensor (n,n)
             The adjacency matrix to load
         """
+        print("Loading adjacency matrix...")
         self._A = A
         self.weakly_connected = is_connected(Graph(A.cpu().numpy()))
         if not self.weakly_connected:
+            print("Reconnecting the new mat")
             self._A = self.connect_graph(A)
+        print("Recomputing weights")
         self.W = self.compute_weights(self._A, self.data, self.b_size)
+        print("Computing precedecessors")
         self.predecessors = self.get_predecessors(self.W)
+        print("Over.")
 
     @torch.no_grad()
     def compute_weights(
@@ -1775,17 +1872,30 @@ class SolverGraphFinsler(torch.nn.Module):
         )
         for start in pbar:
             end = min(start + b_size, N_data)
-            batch_idx = torch.arange(start, end)
-            curr_idx = A[batch_idx].nonzero(as_tuple=False)[:, 1].view(batch_idx.shape[0], -1)
+            batch_idx = torch.arange(start, end)            
+            
+            edge_idx = A[batch_idx].nonzero(as_tuple=False)
+            # When using a loaded A matrix, there can be a different number of neighbors for each point,
+            # so we need to pad the edge_idx to have a fixed number of neighbors for each point
+            padded_edge_idx = _get_padded_neighbor_indices(
+                edge_idx,
+                batch_size=batch_idx.shape[0],
+                target_width=self.n_neighbors,
+                pad_value=0,
+            )
+            curr_idx = padded_edge_idx[:, 1].view(batch_idx.shape[0], -1)
 
-            p_i = data[batch_idx][:, None, None, :]
-            p_j = data[curr_idx][:, :, None, :]
+            p_i = data[batch_idx][:, None, None, :] # (b_size, 1, 1, d)
+            p_j = data[curr_idx][:, :, None, :] # (b_size, n_neighbors, 1, d)
 
             linear_traj = p_i + t * (p_j - p_i)  # (b_size, k, T, d)
             linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
             curve_length = self.compute_distance(linear_traj)
             curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
             W[batch_idx.view(-1, 1), curr_idx] = curve_length
+
+        # Remove padded assignments introduced by variable-degree batches.
+        W = W * A.to(device=W.device, dtype=W.dtype)
 
         W = W.to(device="cpu")
 
@@ -1923,11 +2033,6 @@ class SolverGraphFinsler(torch.nn.Module):
             Adjacency matrix of shape (n, n) with added edges to connect the connected components.
         """
         idx_correspondence = self.get_cc_connections_idx(A, self.data)
-        a = self.data[idx_correspondence]
-        t = torch.arange(0, 1, self.dt, device=self.data.device, dtype=self.data.dtype).view(
-            1, -1, 1
-        )
-
         A[idx_correspondence[:, 0], idx_correspondence[:, 1]] = 1
         A[idx_correspondence[:, 1], idx_correspondence[:, 0]] = 1
         return A
@@ -1977,7 +2082,7 @@ class SolverGraphFinsler(torch.nn.Module):
         S = torch.exp(-W / (2 * sigma**2))
         return S
 
-    def get_predecessors(self,W) -> torch.Tensor:
+    def get_predecessors(self, W) -> torch.Tensor:
         """Get the predecessors for the shortest path computation..."""
         print("Computing predecessors...")
         dst_matrix, predecessors = shortest_path(
