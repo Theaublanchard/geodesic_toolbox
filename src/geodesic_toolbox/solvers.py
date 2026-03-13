@@ -5,6 +5,7 @@ from math import ceil
 from einops import rearrange
 from collections.abc import Callable
 from scipy.integrate import solve_bvp
+from itertools import product
 
 from sklearn.neighbors import NearestNeighbors
 from scipy.sparse import csr_matrix
@@ -1413,8 +1414,9 @@ class SolverGraph(GeodesicDistanceSolver):
             The path in the graph. The value -9999 means the path is done.
         """
         B = start_idx.shape[0]
-        temp_idx = end_idx
-        path = [end_idx]
+        # Clone to avoid in-place updates corrupting the recorded initial endpoint ids.
+        temp_idx = end_idx.clone()
+        path = [end_idx.clone()]
 
         iter = 0
         nb_pts_in_path = torch.zeros(B)
@@ -1668,10 +1670,11 @@ def dst_mat_naive(a: Tensor, b: Tensor, dst_func: GeodesicDistanceSolver) -> Ten
 
     dst = torch.zeros(B, B, device=a.device)
 
-    for i in range(B):
-        for j in range(B):
-            distances = dst_func(a[i].unsqueeze(0), b[j].unsqueeze(0))
-            dst[i, j] = distances
+    for i, j in tqdm(
+        product(range(B), range(B)), total=B * B, desc="Computing distance matrix", unit="pair"
+    ):
+        distances = dst_func(a[i].unsqueeze(0), b[j].unsqueeze(0))
+        dst[i, j] = distances
 
     return dst
 
@@ -1872,8 +1875,8 @@ class SolverGraphFinsler(torch.nn.Module):
         )
         for start in pbar:
             end = min(start + b_size, N_data)
-            batch_idx = torch.arange(start, end)            
-            
+            batch_idx = torch.arange(start, end)
+
             edge_idx = A[batch_idx].nonzero(as_tuple=False)
             # When using a loaded A matrix, there can be a different number of neighbors for each point,
             # so we need to pad the edge_idx to have a fixed number of neighbors for each point
@@ -1885,8 +1888,8 @@ class SolverGraphFinsler(torch.nn.Module):
             )
             curr_idx = padded_edge_idx[:, 1].view(batch_idx.shape[0], -1)
 
-            p_i = data[batch_idx][:, None, None, :] # (b_size, 1, 1, d)
-            p_j = data[curr_idx][:, :, None, :] # (b_size, n_neighbors, 1, d)
+            p_i = data[batch_idx][:, None, None, :]  # (b_size, 1, 1, d)
+            p_j = data[curr_idx][:, :, None, :]  # (b_size, n_neighbors, 1, d)
 
             linear_traj = p_i + t * (p_j - p_i)  # (b_size, k, T, d)
             linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
@@ -1902,75 +1905,8 @@ class SolverGraphFinsler(torch.nn.Module):
         assert is_strongly_connected(
             DiGraph(W.numpy())
         ), "The graph is not connected after computing the weights. This should not happen."
+
         return W
-
-    # @torch.no_grad()
-    # def init_knn_graph(
-    #     self, data: torch.Tensor, n_neighbors: int, b_size: int = 64
-    # ) -> tuple[np.ndarray, NearestNeighbors]:
-    #     """Initialize the graph using a KNN graph.
-
-    #     Parameters
-    #     ----------
-    #     data : torch.Tensor (N,D)
-    #         The data points
-    #     n_neighbors : int
-    #         The number of neighbors to use
-    #     b_size : int
-    #         The size of the batch to use for the computation
-
-    #     Returns
-    #     -------
-    #     W : torch.Tensor (N,N)
-    #         The weight matrix of the graph
-    #     knn : NearestNeighbors
-    #         The KNN object
-    #     """
-    #     # We add one to the number of neighbors to remove the point itself
-    #     knn = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm="ball_tree")
-    #     knn.fit(data.cpu())
-    #     t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(
-    #         1, 1, -1, 1
-    #     )  # (1,1,T,1)
-
-    #     # Find the Euclidean kNN
-    #     N_data = data.shape[0]
-    #     _, indices = knn.kneighbors(data.cpu())
-    #     indices = indices[:, 1:]  # Remove the point itself
-    #     Weight_matrix = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
-
-    #     pbar = tqdm(
-    #         range(0, N_data, self.b_size),
-    #         desc="Initialize Graph",
-    #         unit="batch",
-    #     )
-    #     with torch.no_grad():
-    #         for start in pbar:
-    #             end = min(start + b_size, N_data)
-    #             batch_idx = torch.arange(start, end)  # (b,)
-    #             curr_idx = indices[batch_idx]  # (b,k)
-    #             # Sometimes the batch indices amounts to only one
-    #             # To ensure the dimension is correct, we unsqueeze the batch dimension in that case
-    #             # This is just because numpy (or me idk) sucks and doesn't keep dim
-    #             if curr_idx.ndim == 1:
-    #                 curr_idx = curr_idx[None, :]  # (1,k)
-
-    #             p_i = data[batch_idx][:, None, None, :]  # (b,1,1,d)
-    #             p_j = data[curr_idx][:, :, None, :]  # (b,k,1,d)
-
-    #             linear_traj = p_i + t * (p_j - p_i)  # (b,k,T,d)
-    #             tangent_vectors = p_j - p_i
-    #             tangent_vectors = tangent_vectors.expand(-1, -1, self.T, -1)
-    #             linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
-    #             tangent_vectors = rearrange(tangent_vectors, "b k T d -> (b k) T d")
-    #             curve_length = self.compute_distance(linear_traj, tangent_vectors)
-
-    #             curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
-    #             Weight_matrix[batch_idx.view(-1, 1), curr_idx] = curve_length
-
-    #     if not is_strongly_connected(DiGraph(Weight_matrix.cpu().numpy())):
-    #         Weight_matrix = self.connect_graph(Weight_matrix)
-    #     return Weight_matrix.to("cpu"), knn
 
     def get_cc_connections_idx(self, A, X):
         """
@@ -2213,8 +2149,9 @@ class SolverGraphFinsler(torch.nn.Module):
             The path in the graph. The value -9999 means the path is done.
         """
         B = start_idx.shape[0]
-        temp_idx = end_idx
-        path = [end_idx]
+        # Clone to avoid in-place updates corrupting the recorded initial endpoint ids.
+        temp_idx = end_idx.clone()
+        path = [end_idx.clone()]
 
         iter = 0
         nb_pts_in_path = torch.zeros(B)
