@@ -1080,6 +1080,8 @@ class SolverGraph(GeodesicDistanceSolver):
         if not is_connected(Graph(A)):
             print("Adjacency Graph is not connected : connecting ")
             A = self.connect_graph(A)
+        # Symetrize the adjacency matrix because why not
+        A = np.maximum(A, A.T)
         return torch.from_numpy(A), knn
 
     @property
@@ -1818,6 +1820,8 @@ class SolverGraphFinsler(torch.nn.Module):
         if not is_connected(Graph(A)):
             print("Adjacency Graph is not connected : connecting ")
             A = self.connect_graph(A)
+        # Symmetrize the adjacency matrix because why not
+        A = np.maximum(A, A.T)
         return torch.from_numpy(A), knn
 
     @property
