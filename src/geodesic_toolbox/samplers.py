@@ -1581,8 +1581,8 @@ class ExplicitRHMCSampler(Sampler):
         Tensor (b,)
             The proposal rates.
         """
-        H_new = self.H(z_l_0, v_l_0, z_l_1, v_l_1)
-        H_old = self.H(z_0, v0, z_1, v1)
+        H_new = self.H_base(z_l_0, v_l_0)
+        H_old = self.H_base(z_0, v0)
         alpha = torch.exp(-H_new + H_old)
         return torch.min(torch.ones_like(alpha), alpha)
 
@@ -1758,7 +1758,7 @@ class ExplicitRHMCSampler(Sampler):
 
         for k in pbar:
             v_0 = self.sample_momentum(z_0)
-            v_1 = self.sample_momentum(z_1)
+            v_1 = v_0.clone()
 
             z_l_0, v_l_0, z_l_1, v_l_1 = self.leapfrog(z_0, v_0, z_1, v_1)
 
