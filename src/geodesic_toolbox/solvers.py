@@ -1121,7 +1121,7 @@ class SolverGraph(GeodesicDistanceSolver):
         W : torch.Tensor (n,n)
             The weighted adjacency matrix where W[i,j] approx dst(x_i,x_j)
         """
-        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(1, 1, -1, 1)
+        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(1, -1, 1)
         N_data = data.shape[0]
         W = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
 
@@ -1132,27 +1132,22 @@ class SolverGraph(GeodesicDistanceSolver):
         )
         for start in pbar:
             end = min(start + b_size, N_data)
-            batch_idx = torch.arange(start, end)
-            edge_idx = A[batch_idx].nonzero(as_tuple=False)
-            # When using a loaded A matrix, there can be a different number of neighbors for each point,
-            # so we need to pad the edge_idx to have a fixed number of neighbors for each point
-            padded_edge_idx = _get_padded_neighbor_indices(
-                edge_idx,
-                batch_size=batch_idx.shape[0],
-                target_width=self.n_neighbors,
-                pad_value=0,
-            )
-            curr_idx = padded_edge_idx[:, 1].view(batch_idx.shape[0], -1)
+            batch_idx = torch.arange(start, end)  # (b_size,)
+            edge_idx = A[batch_idx].nonzero(as_tuple=False)  # (num_edges_in_batch, 2)
+            if edge_idx.numel() == 0:
+                continue
 
-            p_i = data[batch_idx][:, None, None, :]
-            p_j = data[curr_idx][:, :, None, :]
+            row_idx = batch_idx[edge_idx[:, 0]]
+            curr_idx = edge_idx[:, 1]
 
-            linear_traj = p_i + t * (p_j - p_i)  # (b_size, k, T, d)
-            linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
+            p_i = data[row_idx][:, None, :]
+            p_j = data[curr_idx][:, None, :]
+
+            linear_traj = p_i + t * (p_j - p_i)  # (n_edges, T, d)
             curve_length = self.compute_distance(linear_traj)
-            curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
-            W[batch_idx.view(-1, 1), curr_idx] = curve_length
-            W[curr_idx, batch_idx.view(-1, 1)] = curve_length
+
+            W[row_idx, curr_idx] = curve_length
+            W[curr_idx, row_idx] = curve_length
 
         # Remove padded assignments introduced by variable-degree batches.
         W = W * A.to(device=W.device, dtype=W.dtype)
@@ -1868,7 +1863,7 @@ class SolverGraphFinsler(torch.nn.Module):
         W : torch.Tensor (n,n)
             The weighted adjacency matrix where W[i,j] approx dst(x_i,x_j)
         """
-        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(1, 1, -1, 1)
+        t = torch.arange(0, 1, self.dt, device=data.device, dtype=data.dtype).view(1, -1, 1)
         N_data = data.shape[0]
         W = torch.zeros((N_data, N_data), device=data.device, dtype=data.dtype)
 
@@ -1882,24 +1877,19 @@ class SolverGraphFinsler(torch.nn.Module):
             batch_idx = torch.arange(start, end)
 
             edge_idx = A[batch_idx].nonzero(as_tuple=False)
-            # When using a loaded A matrix, there can be a different number of neighbors for each point,
-            # so we need to pad the edge_idx to have a fixed number of neighbors for each point
-            padded_edge_idx = _get_padded_neighbor_indices(
-                edge_idx,
-                batch_size=batch_idx.shape[0],
-                target_width=self.n_neighbors,
-                pad_value=0,
-            )
-            curr_idx = padded_edge_idx[:, 1].view(batch_idx.shape[0], -1)
+            if edge_idx.numel() == 0:
+                continue
 
-            p_i = data[batch_idx][:, None, None, :]  # (b_size, 1, 1, d)
-            p_j = data[curr_idx][:, :, None, :]  # (b_size, n_neighbors, 1, d)
+            row_idx = batch_idx[edge_idx[:, 0]]
+            curr_idx = edge_idx[:, 1]
 
-            linear_traj = p_i + t * (p_j - p_i)  # (b_size, k, T, d)
-            linear_traj = rearrange(linear_traj, "b k T d -> (b k) T d")
+            p_i = data[row_idx][:, None, :]
+            p_j = data[curr_idx][:, None, :]
+
+            linear_traj = p_i + t * (p_j - p_i)  # (n_edges, T, d)
             curve_length = self.compute_distance(linear_traj)
-            curve_length = rearrange(curve_length, "(b k) -> b k", b=batch_idx.shape[0])
-            W[batch_idx.view(-1, 1), curr_idx] = curve_length
+
+            W[row_idx, curr_idx] = curve_length
 
         # Remove padded assignments introduced by variable-degree batches.
         W = W * A.to(device=W.device, dtype=W.dtype)
