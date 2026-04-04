@@ -1165,7 +1165,8 @@ class CentroidsCometric(CoMetric):
             cross_term = torch.einsum("bd,kd->bk", z, self.centroids)  # (b,k)
 
         dz = z_term + c_term - 2 * cross_term
-        weights = torch.exp(-(dz**2) / (2 * self.temperature**2))  # (b,K)
+        tau = self.temperature.to(z.device, dtype=z.dtype)
+        weights = torch.exp(-(dz**2) / (2 * tau**2))  # (b,K)
         G_inv = self.cometric_centroids  # (k,d,d) | (k,d)
         if not self.is_diag:
             G_inv = torch.einsum("bk,kij->bij", weights, G_inv)
