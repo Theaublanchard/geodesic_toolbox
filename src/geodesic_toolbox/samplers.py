@@ -1298,6 +1298,191 @@ class ImplicitRHMCSampler(Sampler):
         return z
 
 
+class Hamiltonian(torch.nn.Module):
+    """
+    Hamiltonian function for Riemannian Hamiltonian Monte Carlo.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, z: Tensor, v: Tensor) -> Tensor:
+        """
+        Compute the Hamiltonian H(z,v)
+
+        Parameters
+        ----------
+        z : Tensor (b,d)
+            The position.
+        v : Tensor (b,d)
+            The velocity.
+
+        Returns
+        -------
+        Tensor (b,)
+        """
+        raise NotImplementedError(
+            "The Hamiltonian function must be implemented by inheriting this class."
+        )
+
+
+class ExplicitLeapfrogIntegrator(torch.nn.Module):
+    """
+    Explicit leapfrog integrator for Riemannian Hamiltonian Monte Carlo.
+
+    Parameters:
+    ----------
+    H : Hamiltonian
+        The Hamiltonian function H(z, v) that takes position q and momentum p and returns the energy.
+    gamma : float
+        The step size for the leapfrog integrator.
+    omega : float
+        The binding parameter for the leapfrog integrator.
+    """
+
+    def __init__(self, H: Hamiltonian, gamma: float, omega: float):
+        super().__init__()
+        self.H_base = H
+        self.gamma = gamma
+        self.omega = omega
+
+        c = torch.Tensor([2 * self.omega * self.gamma]).cos()
+        s = torch.Tensor([2 * self.omega * self.gamma]).sin()
+        self.register_buffer("c", c, persistent=False)
+        self.register_buffer("s", s, persistent=False)
+
+        # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
+        no_batch_H = lambda z, v: self.H_base(z.unsqueeze(0), v.unsqueeze(0)).squeeze(0)
+        self._dH_dz = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
+        self._dH_dv = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
+        self.dH_dz = lambda z, v: self._dH_dz(z, v)
+        self.dH_dv = lambda z, v: self._dH_dv(z, v)
+
+    def binding(self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor) -> Tensor:
+        """
+        Compute the binding energy between two states.
+
+        Parameters
+        ----------
+        z_0 : Tensor (b,d)
+            The position of the first state.
+        v_0 : Tensor (b,d)
+            The velocity of the first state.
+        z_1 : Tensor (b,d)
+            The position of the second state.
+        v_1 : Tensor (b,d)
+            The velocity of the second state.
+
+        Returns
+        -------
+        Tensor (b,)
+            The binding energy.
+        """
+        h = torch.linalg.vector_norm(z_1 - z_0, dim=-1) ** 2 / 2
+        h += torch.linalg.vector_norm(v_1 - v_0, dim=-1) ** 2 / 2
+        return h
+
+    def H(self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor) -> Tensor:
+        """
+        Compute the augmented Hamiltonian H(z_0, v_0, z_1, v_1) = H(z_0, v_0) + H(z_1, v_1) + omega * binding(z_0, v_0, z_1, v_1)
+
+        Parameters
+        ----------
+        z_0 : Tensor (b,d)
+            The position of the first state.
+        v_0 : Tensor (b,d)
+            The velocity of the first state.
+        z_1 : Tensor (b,d)
+            The position of the second state.
+        v_1 : Tensor (b,d)
+            The velocity of the second state.
+
+        Returns
+        -------
+        Tensor (b,)
+            The augmented Hamiltonian.
+        """
+        H_0 = self.H_base(z_0, v_0)
+        H_1 = self.H_base(z_1, v_1)
+        H = H_0 + H_1 + self.omega * self.binding(z_0, v_0, z_1, v_1)
+        return H
+
+    def leapfrog_step(
+        self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        Leapfrog step for the augmented Hamiltonian.
+        Pseudo code in `Introducing an Explicit Symplectic Integration Scheme for Riemannian Manifold Hamiltonian Monte Carlo`
+        by Cobb et Baydin et al (2019).
+
+        Parameters
+        ----------
+        z_0 : Tensor (b,d)
+            The position of the first state.
+        v_0 : Tensor (b,d)
+            The velocity of the first state.
+        z_1 : Tensor (b,d)
+            The position of the second state.
+        v_1 : Tensor (b,d)
+            The velocity of the second state.
+
+        Returns
+        -------
+        z_0_new : Tensor (b,d)
+            The new position of the first state.
+        v_0_new : Tensor (b,d)
+            The new velocity of the first state.
+        z_1_new : Tensor (b,d)
+            The new position of the second state.
+        v_1_new : Tensor (b,d)
+            The new velocity of the second state.
+        """
+        c = self.c.to(z_0.device).to(z_0.dtype)
+        s = self.s.to(z_0.device).to(z_0.dtype)
+
+        v_0_new = v_0 - self.gamma / 2 * self.dH_dz(z_0, v_1)
+        z_1_new = z_1 + self.gamma / 2 * self.dH_dv(z_0, v_1)
+        v_1_new = v_1 - self.gamma / 2 * self.dH_dz(z_1_new, v_0)
+        z_0_new = z_0 + self.gamma / 2 * self.dH_dv(z_1_new, v_0)
+
+        z_0_new = (z_0_new + z_1_new + c * (z_0_new - z_1_new) + s * (v_0_new - v_1_new)) / 2
+        v_0_new = (v_0_new + v_1_new - s * (z_0_new - z_1_new) + c * (v_0_new - v_1_new)) / 2
+        z_1_new = (z_0_new + z_1_new - c * (z_0_new - z_1_new) - s * (v_0_new - v_1_new)) / 2
+        v_1_new = (v_0_new + v_1_new + s * (z_0_new - z_1_new) - c * (v_0_new - v_1_new)) / 2
+
+        v_1_new = v_1_new - self.gamma / 2 * self.dH_dz(z_1_new, v_0_new)
+        z_0_new = z_0_new + self.gamma / 2 * self.dH_dv(z_1_new, v_0_new)
+        v_0_new = v_0_new - self.gamma / 2 * self.dH_dz(z_0_new, v_1_new)
+        z_1_new = z_1_new + self.gamma / 2 * self.dH_dv(z_0_new, v_1_new)
+
+        return z_0_new, v_0_new, z_1_new, v_1_new
+
+    @torch.no_grad()
+    def forward(self, z_0: Tensor, v_0: Tensor, L: int, return_traj: bool = False):
+        z_1, v_1 = z_0.clone(), v_0.clone()
+        if return_traj:
+            traj_z = [z_0.clone().detach()]
+            traj_v = [v_0.clone().detach()]
+
+        for k in tqdm(range(L)):
+            z_0, v_0, z_1, v_1 = self.leapfrog_step(z_0, v_0, z_1, v_1)
+
+            if return_traj:
+                # Keep graph only on the final point.
+                if k == L - 1:
+                    traj_z.append(z_0.clone())
+                    traj_v.append(v_0.clone())
+                else:
+                    traj_z.append(z_0.clone().detach())
+                    traj_v.append(v_0.clone().detach())
+
+        if return_traj:
+            traj_z = torch.stack(traj_z, dim=1)
+            traj_v = torch.stack(traj_v, dim=1)
+            return traj_z, traj_v
+        return z_0, v_0
+
+
 class ExplicitRHMCSampler(Sampler):
     """
     Explicit Riemannian Hamiltonian Monte Carlo sampler with a pdf defined on a manifold.
