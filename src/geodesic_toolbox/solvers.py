@@ -3421,6 +3421,8 @@ class ExpMapRanders(torch.nn.Module):
         The maximum time to use for the geodesic trajectory.
     omega : float
         Coupling parameter for the integrator.
+    substep : int
+        The number of substeps to use for the integrator. Default is 1 (no substeps).
     """
 
     def __init__(
@@ -3429,6 +3431,7 @@ class ExpMapRanders(torch.nn.Module):
         T_max=1.0,
         T=10,
         omega: float = 10.0,
+        substeps: int = 1,
     ):
         super().__init__()
         self.randers = randers
@@ -3437,6 +3440,7 @@ class ExpMapRanders(torch.nn.Module):
         self.t = torch.linspace(0, T_max, T)
         self.dt = self.t[1] - self.t[0]
         self.omega = omega
+        self.substeps = substeps
 
         self.dual_r = DualRandersMetrics(randers)
 
@@ -3444,6 +3448,7 @@ class ExpMapRanders(torch.nn.Module):
             H=self.H,
             gamma=self.dt,
             omega=self.omega,
+            substeps=self.substeps,
         )
 
     def legendre_transform(self, q: Tensor, v: Tensor) -> Tensor:
