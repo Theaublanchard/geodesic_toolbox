@@ -14,7 +14,14 @@ from scipy.interpolate import CubicSpline
 from networkx import Graph, DiGraph, is_connected, is_strongly_connected, is_weakly_connected
 import networkx as nx
 
-from .cometric import CoMetric, IdentityCoMetric, FinslerMetric
+from .cometric import (
+    CoMetric,
+    IdentityCoMetric,
+    FinslerMetric,
+    RandersMetrics,
+    DualRandersMetrics,
+)
+from .samplers import ExplicitLeapfrogIntegrator
 from .utils import (
     magnification_factor,
     # hamiltonian,
@@ -3399,6 +3406,166 @@ class SolverGraphGEORCEFinsler(GEORCEFinsler):
         return final_traj
 
 
+class ExpMapRanders(torch.nn.Module):
+    """
+    Shoot a geodesic trajectory on a Randers metric using the shooting method.
+    We use the hamiltonian formatuion via the dual Randers metric on the cotangent space.
+
+    Parameters:
+    -----------
+    randers : RandersMetric
+        The base Randers metric to compute the geodesics
+    T: int
+        The number of time points to compute along the trajectory
+    T_max : float
+        The maximum time to use for the geodesic trajectory.
+    omega : float
+        Coupling parameter for the integrator.
+    """
+
+    def __init__(
+        self,
+        randers: RandersMetrics,
+        T_max=1.0,
+        T=10,
+        omega: float = 10.0,
+    ):
+        super().__init__()
+        self.randers = randers
+        self.T = T
+        self.T_max = T_max
+        self.t = torch.linspace(0, T_max, T)
+        self.dt = self.t[1] - self.t[0]
+        self.omega = omega
+
+        self.dual_r = DualRandersMetrics(randers)
+
+        self.shooter = ExplicitLeapfrogIntegrator(
+            H=self.H,
+            gamma=self.dt,
+            omega=self.omega,
+        )
+
+    def H(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Hamiltonian function for the Riemannian manifold.
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        p : torch.Tensor (b, d)
+            Momentum
+
+        Returns
+        -------
+        H : torch.Tensor (b,)
+            Hamiltonian value
+        """
+        H = self.dual_r(q, p)
+        return 0.5 * H**2
+
+    def forward(self, q0: Tensor, p0: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Computes the geodesic trajectory starting from position q0 and initial momentum p0
+
+        Parameters
+        ----------
+        q0 : torch.Tensor (b, d)
+            Initial position
+        p0 : torch.Tensor (b, d)
+            Initial momentum
+
+        Returns
+        -------
+        q_t : torch.Tensor (b,T,d)
+            Geodesic trajectory
+        p_t : torch.Tensor (b,T,d)
+            Momentum along the geodesic trajectory
+        """
+        traj_q, traj_p = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
+        return traj_q, traj_p
+
+
+class ExpMapRiemann(torch.nn.Module):
+    """
+    Shoot a geodesic trajectory on a Riemannain metric using the shooting method.
+    We use the hamiltonian formatuion.
+
+    Parameters:
+    -----------
+    cometric : CoMetric
+        The base Riemannian cometric to compute the geodesics
+    T: int
+        The number of time points to compute along the trajectory
+    T_max : float
+        The maximum time to use for the geodesic trajectory.
+    omega : float
+        Coupling parameter for the integrator.
+    """
+
+    def __init__(
+        self,
+        cometric: CoMetric,
+        T_max=1.0,
+        T=10,
+        omega: float = 10.0,
+    ):
+        super().__init__()
+        self.cometric = cometric
+        self.T = T
+        self.T_max = T_max
+        self.t = torch.linspace(0, T_max, T)
+        self.dt = self.t[1] - self.t[0]
+        self.omega = omega
+
+        self.shooter = ExplicitLeapfrogIntegrator(
+            H=self.H,
+            gamma=self.dt,
+            omega=self.omega,
+        )
+
+    def H(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Hamiltonian function for the Riemannian manifold.
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        p : torch.Tensor (b, d)
+            Momentum
+
+        Returns
+        -------
+        H : torch.Tensor (b,)
+            Hamiltonian value
+        """
+        H = self.cometric(q, p)
+        return 0.5 * H
+
+    def forward(self, q0: Tensor, p0: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Computes the geodesic trajectory starting from position q0 and initial momentum p0
+
+        Parameters
+        ----------
+        q0 : torch.Tensor (b, d)
+            Initial position
+        p0 : torch.Tensor (b, d)
+            Initial momentum
+
+        Returns
+        -------
+        q_t : torch.Tensor (b,T,d)
+            Geodesic trajectory
+        p_t : torch.Tensor (b,T,d)
+            Momentum along the geodesic trajectory
+        """
+        traj_q, traj_p = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
+        return traj_q, traj_p
+
+
 class ExpMapFinsler(torch.nn.Module):
     """
     Computes the geodesic distances between points using the shooting method
@@ -3660,254 +3827,254 @@ class ExpMapFinsler(torch.nn.Module):
         return trajectories
 
 
-class ExpMapRiemann(torch.nn.Module):
-    """
-    Computes the geodesic distances between points using the shooting method
-    on a Riemannian manifold. Here the geodesic is computed by
-    integrating Hamilton's equations.
+# class ExpMapRiemann(torch.nn.Module):
+#     """
+#     Computes the geodesic distances between points using the shooting method
+#     on a Riemannian manifold. Here the geodesic is computed by
+#     integrating Hamilton's equations.
 
-    Parameters:
-    ----------
-    cometric : CoMetric
-        The Riemannian cometric to use for the geodesic distances.
-    T : int
-        The number of time steps to use for the geodesic trajectory.
-    T_max : float
-        The maximum time to use for the geodesic trajectory.
-    method : str
-        The method to use for the ODE solver. See torchdiffeq documentation for more details.
-    boundary : float
-        The boundary value to stop the ODE solver when the state diverges.
-    resample : bool
-        If True, the trajectory is resampled to have T points even if the ODE solver stops early.
-    """
+#     Parameters:
+#     ----------
+#     cometric : CoMetric
+#         The Riemannian cometric to use for the geodesic distances.
+#     T : int
+#         The number of time steps to use for the geodesic trajectory.
+#     T_max : float
+#         The maximum time to use for the geodesic trajectory.
+#     method : str
+#         The method to use for the ODE solver. See torchdiffeq documentation for more details.
+#     boundary : float
+#         The boundary value to stop the ODE solver when the state diverges.
+#     resample : bool
+#         If True, the trajectory is resampled to have T points even if the ODE solver stops early.
+#     """
 
-    def __init__(
-        self,
-        cometric: CoMetric,
-        T_max=1.0,
-        T=100,
-        method="dopri5",
-        boundary=1e5,
-        resample=True,
-    ):
-        super().__init__()
-        self.cometric = cometric
-        self.T = T
-        self.T_max = T_max
-        self.t = torch.linspace(0, T_max, T)
-        self.method = method
-        self.boundary = boundary
-        self.resample = resample
+#     def __init__(
+#         self,
+#         cometric: CoMetric,
+#         T_max=1.0,
+#         T=100,
+#         method="dopri5",
+#         boundary=1e5,
+#         resample=True,
+#     ):
+#         super().__init__()
+#         self.cometric = cometric
+#         self.T = T
+#         self.T_max = T_max
+#         self.t = torch.linspace(0, T_max, T)
+#         self.method = method
+#         self.boundary = boundary
+#         self.resample = resample
 
-    def hamiltonian(self, q: Tensor, p: Tensor) -> Tensor:
-        """
-        Hamiltonian function for the Riemannian manifold.
+#     def hamiltonian(self, q: Tensor, p: Tensor) -> Tensor:
+#         """
+#         Hamiltonian function for the Riemannian manifold.
 
-        Parameters
-        ----------
-        q : torch.Tensor (d,)
-            Position
-        p : torch.Tensor (d,)
-            Momentum
+#         Parameters
+#         ----------
+#         q : torch.Tensor (d,)
+#             Position
+#         p : torch.Tensor (d,)
+#             Momentum
 
-        Returns
-        -------
-        H : torch.Tensor
-            Hamiltonian value
-        """
-        H = 0.5 * self.cometric.cometric(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
-        return H
+#         Returns
+#         -------
+#         H : torch.Tensor
+#             Hamiltonian value
+#         """
+#         H = 0.5 * self.cometric.cometric(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
+#         return H
 
-    def get_dH(self, q: Tensor, p: Tensor) -> tuple[Tensor, Tensor]:
-        """
-        Computes the derivatives of the Hamiltonian with respect to position and momentum.
+#     def get_dH(self, q: Tensor, p: Tensor) -> tuple[Tensor, Tensor]:
+#         """
+#         Computes the derivatives of the Hamiltonian with respect to position and momentum.
 
-        Parameters
-        ----------
-        q : torch.Tensor (d,)
-            Position
-        p : torch.Tensor (d,)
-            Momentum
+#         Parameters
+#         ----------
+#         q : torch.Tensor (d,)
+#             Position
+#         p : torch.Tensor (d,)
+#             Momentum
 
-        Returns
-        -------
-        dH_dq : torch.Tensor (d,)
-            Derivative of the Hamiltonian with respect to position
-        dH_dp : torch.Tensor (d,)
-            Derivative of the Hamiltonian with respect to momentum
-        """
-        H = self.hamiltonian(q, p)
-        dH_dq, dH_qp = torch.autograd.grad(H, (q, p), create_graph=True)
-        return dH_dq, dH_qp
+#         Returns
+#         -------
+#         dH_dq : torch.Tensor (d,)
+#             Derivative of the Hamiltonian with respect to position
+#         dH_dp : torch.Tensor (d,)
+#             Derivative of the Hamiltonian with respect to momentum
+#         """
+#         H = self.hamiltonian(q, p)
+#         dH_dq, dH_qp = torch.autograd.grad(H, (q, p), create_graph=True)
+#         return dH_dq, dH_qp
 
-    def geodesic_ode(self, t: float, state: Tensor) -> Tensor:
-        """
-        Computes the geodesic ODE using Hamilton's equations.
+#     def geodesic_ode(self, t: float, state: Tensor) -> Tensor:
+#         """
+#         Computes the geodesic ODE using Hamilton's equations.
 
-        Parameters
-        ----------
-        t : float
-            Time, unused. For compatibility with torchdiffeq
-        state : torch.Tensor (2d,)
-            State (position and momentum)
+#         Parameters
+#         ----------
+#         t : float
+#             Time, unused. For compatibility with torchdiffeq
+#         state : torch.Tensor (2d,)
+#             State (position and momentum)
 
-        Returns
-        -------
-        dstate_dt : torch.Tensor (2d,)
-            Derivative of the state with respect to time
-        """
-        d = state.shape[0] // 2
-        q, p = state[:d], state[d:]
-        dH_dq, dH_qp = self.get_dH(q, p)
-        return torch.cat((dH_qp, -dH_dq))
+#         Returns
+#         -------
+#         dstate_dt : torch.Tensor (2d,)
+#             Derivative of the state with respect to time
+#         """
+#         d = state.shape[0] // 2
+#         q, p = state[:d], state[d:]
+#         dH_dq, dH_qp = self.get_dH(q, p)
+#         return torch.cat((dH_qp, -dH_dq))
 
-    def resample_state(self, state):
-        """
-        Resample the trajectory to have self.T points using cubic splines.
+#     def resample_state(self, state):
+#         """
+#         Resample the trajectory to have self.T points using cubic splines.
 
-        Parameters
-        ----------
-        state : torch.Tensor (T',2d)
-            State (position and momentum), T' <= T if the out of boundary event is triggered
-        Returns
-        -------
-        state : torch.Tensor (T,2d)
-            Resampled state (position and momentum)
-        """
-        x = state[:, : state.shape[1] // 2]
-        v = state[:, state.shape[1] // 2 :]
+#         Parameters
+#         ----------
+#         state : torch.Tensor (T',2d)
+#             State (position and momentum), T' <= T if the out of boundary event is triggered
+#         Returns
+#         -------
+#         state : torch.Tensor (T,2d)
+#             Resampled state (position and momentum)
+#         """
+#         x = state[:, : state.shape[1] // 2]
+#         v = state[:, state.shape[1] // 2 :]
 
-        cs_x = CubicSpline(
-            torch.linspace(0, self.T_max, x.shape[0]).cpu(),
-            x.cpu(),
-            axis=0,
-        )
-        new_x = torch.tensor(cs_x(self.t.cpu()), device=x.device)
+#         cs_x = CubicSpline(
+#             torch.linspace(0, self.T_max, x.shape[0]).cpu(),
+#             x.cpu(),
+#             axis=0,
+#         )
+#         new_x = torch.tensor(cs_x(self.t.cpu()), device=x.device)
 
-        cs_v = CubicSpline(
-            torch.linspace(0, self.T_max, v.shape[0]).cpu(),
-            v.cpu(),
-            axis=0,
-        )
-        new_v = torch.tensor(cs_v(self.t.cpu()), device=v.device)
+#         cs_v = CubicSpline(
+#             torch.linspace(0, self.T_max, v.shape[0]).cpu(),
+#             v.cpu(),
+#             axis=0,
+#         )
+#         new_v = torch.tensor(cs_v(self.t.cpu()), device=v.device)
 
-        return torch.cat((new_x, new_v), dim=-1)
+#         return torch.cat((new_x, new_v), dim=-1)
 
-    def stop_when_diverge(self, state):
-        """
-        Filter the trajectory to keep only the points where the norm of the position is below the boundary.
-        Stops the trajectory when the boundary is exceeded.
+#     def stop_when_diverge(self, state):
+#         """
+#         Filter the trajectory to keep only the points where the norm of the position is below the boundary.
+#         Stops the trajectory when the boundary is exceeded.
 
-        Parameters
-        ----------
-        state : torch.Tensor (2d,)
-            State (position and momentum)
+#         Parameters
+#         ----------
+#         state : torch.Tensor (2d,)
+#             State (position and momentum)
 
-        Returns
-        -------
-        state : torch.Tensor (T',2d)
-            Filtered state (position and momentum), T' <= T if the out of boundary event is triggered
-        """
-        q = state[: state.shape[0] // 2]
-        q_norm = torch.linalg.vector_norm(q, dim=-1)
-        dq = q_norm - self.boundary
-        outside_pts = torch.where(dq > 0)[0]
-        if len(outside_pts) > 0:
-            first_outside = outside_pts[0]
-            state = state[:first_outside]
-            if self.resample:
-                state = self.resample_state(state)
-        return state
+#         Returns
+#         -------
+#         state : torch.Tensor (T',2d)
+#             Filtered state (position and momentum), T' <= T if the out of boundary event is triggered
+#         """
+#         q = state[: state.shape[0] // 2]
+#         q_norm = torch.linalg.vector_norm(q, dim=-1)
+#         dq = q_norm - self.boundary
+#         outside_pts = torch.where(dq > 0)[0]
+#         if len(outside_pts) > 0:
+#             first_outside = outside_pts[0]
+#             state = state[:first_outside]
+#             if self.resample:
+#                 state = self.resample_state(state)
+#         return state
 
-    def geodesic_shooting(self, q0: Tensor, p0: Tensor) -> tuple[Tensor, Tensor]:
-        """
-        Computes the geodesic trajectory starting from position q0 and initial momentum p0
+#     def geodesic_shooting(self, q0: Tensor, p0: Tensor) -> tuple[Tensor, Tensor]:
+#         """
+#         Computes the geodesic trajectory starting from position q0 and initial momentum p0
 
-        Parameters
-        ----------
-        q0 : torch.Tensor (d,)
-            Initial position
-        p0 : torch.Tensor (d,)
-            Initial momentum
+#         Parameters
+#         ----------
+#         q0 : torch.Tensor (d,)
+#             Initial position
+#         p0 : torch.Tensor (d,)
+#             Initial momentum
 
-        Returns
-        -------
-        q_t : torch.Tensor (T',d)
-            Geodesic trajectory, T' <= T if the event is triggered
-        p_t : torch.Tensor (T',d)
-            Momentum along the geodesic trajectory, T' <= T if the event is triggered
-        """
-        state0 = torch.cat((q0, p0))
-        state_T = odeint(
-            func=self.geodesic_ode,
-            y0=state0,
-            t=self.t.to(q0.device),
-            method=self.method,
-        )
-        state_T = self.stop_when_diverge(state_T)
-        q_t = state_T[:, : q0.shape[0]]
-        p_t = state_T[:, q0.shape[0] :]
-        return q_t, p_t
+#         Returns
+#         -------
+#         q_t : torch.Tensor (T',d)
+#             Geodesic trajectory, T' <= T if the event is triggered
+#         p_t : torch.Tensor (T',d)
+#             Momentum along the geodesic trajectory, T' <= T if the event is triggered
+#         """
+#         state0 = torch.cat((q0, p0))
+#         state_T = odeint(
+#             func=self.geodesic_ode,
+#             y0=state0,
+#             t=self.t.to(q0.device),
+#             method=self.method,
+#         )
+#         state_T = self.stop_when_diverge(state_T)
+#         q_t = state_T[:, : q0.shape[0]]
+#         p_t = state_T[:, q0.shape[0] :]
+#         return q_t, p_t
 
-    def compute_distance(self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None):
-        """Given a trajectory and the tangent vectors, compute the distance
-        under the finsler metric.
+#     def compute_distance(self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None):
+#         """Given a trajectory and the tangent vectors, compute the distance
+#         under the finsler metric.
 
-        Parameters
-        ----------
-        traj : torch.Tensor (b,T,d)
-            The trajectory. There are b trajectories of T points in d dimensions
-        tangent_vectors : torch.Tensor (b,T,d)
-            The tangent vectors at each point of the trajectory
-            If None, the tangent vectors are computed as the difference between consecutive points.
-        Returns
-        -------
-        dst : torch.Tensor (b,)
-            The distance between the two points
-        """
-        if tangent_vectors is None:
-            # Compute the tangent vectors as the difference between consecutive points
-            tangent_vectors = torch.zeros_like(traj)
-            tangent_vectors[:, :-1, :] = traj[:, 1:, :] - traj[:, :-1, :]
-            tangent_vectors[:, -1, :] = traj[:, -1, :] - traj[:, -2, :]
-        distances = torch.stack(
-            [self.finsler(m, seg) for m, seg in zip(traj, tangent_vectors)]
-        )  # (B, T)
-        distances = distances.relu().sum(dim=1)  # (B,)
-        return distances
+#         Parameters
+#         ----------
+#         traj : torch.Tensor (b,T,d)
+#             The trajectory. There are b trajectories of T points in d dimensions
+#         tangent_vectors : torch.Tensor (b,T,d)
+#             The tangent vectors at each point of the trajectory
+#             If None, the tangent vectors are computed as the difference between consecutive points.
+#         Returns
+#         -------
+#         dst : torch.Tensor (b,)
+#             The distance between the two points
+#         """
+#         if tangent_vectors is None:
+#             # Compute the tangent vectors as the difference between consecutive points
+#             tangent_vectors = torch.zeros_like(traj)
+#             tangent_vectors[:, :-1, :] = traj[:, 1:, :] - traj[:, :-1, :]
+#             tangent_vectors[:, -1, :] = traj[:, -1, :] - traj[:, -2, :]
+#         distances = torch.stack(
+#             [self.finsler(m, seg) for m, seg in zip(traj, tangent_vectors)]
+#         )  # (B, T)
+#         distances = distances.relu().sum(dim=1)  # (B,)
+#         return distances
 
-    def forward(self, x_0: Tensor, v_0: Tensor, convert_to_moment: bool = False) -> Tensor:
-        """Given the start and initial velocity points, compute the geodesic path
-        by computing the exp map.
+#     def forward(self, x_0: Tensor, v_0: Tensor, convert_to_moment: bool = False) -> Tensor:
+#         """Given the start and initial velocity points, compute the geodesic path
+#         by computing the exp map.
 
-        Parameters:
-        ----------
-        x_0: Tensor (B, d)
-            The starting points of the geodesic.
-        v_0: Tensor (B, d)
-            The initial velocities of the geodesic.
-        convert_to_moment: bool
-            If True, convert the initial velocity to momentum using the cometric.
+#         Parameters:
+#         ----------
+#         x_0: Tensor (B, d)
+#             The starting points of the geodesic.
+#         v_0: Tensor (B, d)
+#             The initial velocities of the geodesic.
+#         convert_to_moment: bool
+#             If True, convert the initial velocity to momentum using the cometric.
 
-        Returns:
-        -------
-        trajectories: Tensor (B, T, d) or list of Tensor or shape (B, T_i, d)
-            The geodesic trajectories starting at x_0 with initial velocity v_0
-        """
-        if convert_to_moment:
-            G_inv = self.cometric.cometric_tensor(x_0)
-            if self.cometric.is_diag:
-                v_0 = G_inv * v_0
-            else:
-                v_0 = torch.einsum("bij,bj->bi", G_inv, v_0)
+#         Returns:
+#         -------
+#         trajectories: Tensor (B, T, d) or list of Tensor or shape (B, T_i, d)
+#             The geodesic trajectories starting at x_0 with initial velocity v_0
+#         """
+#         if convert_to_moment:
+#             G_inv = self.cometric.cometric_tensor(x_0)
+#             if self.cometric.is_diag:
+#                 v_0 = G_inv * v_0
+#             else:
+#                 v_0 = torch.einsum("bij,bj->bi", G_inv, v_0)
 
-        trajectories = []
-        B, d = x_0.shape
-        assert v_0.shape == (B, d), f"Both tensors must have the same shape {(B, d)=}"
-        for b in range(B):
-            x_t, v_t = self.geodesic_shooting(x_0[b], v_0[b])
-            trajectories.append(x_t)
-        if len(set([traj.shape[0] for traj in trajectories])) == 1:
-            trajectories = torch.stack(trajectories, dim=0)  # (B, T, d)
-        return trajectories
+#         trajectories = []
+#         B, d = x_0.shape
+#         assert v_0.shape == (B, d), f"Both tensors must have the same shape {(B, d)=}"
+#         for b in range(B):
+#             x_t, v_t = self.geodesic_shooting(x_0[b], v_0[b])
+#             trajectories.append(x_t)
+#         if len(set([traj.shape[0] for traj in trajectories])) == 1:
+#             trajectories = torch.stack(trajectories, dim=0)  # (B, T, d)
+#         return trajectories
