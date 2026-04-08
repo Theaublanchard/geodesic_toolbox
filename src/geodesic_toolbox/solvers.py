@@ -3446,6 +3446,33 @@ class ExpMapRanders(torch.nn.Module):
             omega=self.omega,
         )
 
+    def legendre_transform(self, q: Tensor, v: Tensor) -> Tensor:
+        """
+        Convert a speed vector to a momentum vector using the Legendre transform.
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        v : torch.Tensor (b, d)
+            Speed
+
+        Returns
+        -------
+        p : torch.Tensor (b, d)
+            Momentum
+        """
+        f = self.randers(q, v)[:, None]
+        alpha = self.randers.base_cometric.metric(q, v).sqrt()[:, None]
+        omega = self.randers.omega(q) * self.randers.beta
+        G = self.randers.base_cometric.metric_tensor(q)
+        if self.randers.base_cometric.is_diag:
+            Gv = G * v
+        else:
+            Gv = torch.einsum("ij,j->i", G, v)
+        p = f * (Gv / alpha + omega)
+        return p
+
     def H(self, q: Tensor, p: Tensor) -> Tensor:
         """
         Hamiltonian function for the Riemannian manifold.
@@ -3465,16 +3492,16 @@ class ExpMapRanders(torch.nn.Module):
         H = self.dual_r(q, p)
         return 0.5 * H**2
 
-    def forward(self, q0: Tensor, p0: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, q0: Tensor, v0: Tensor) -> tuple[Tensor, Tensor]:
         """
-        Computes the geodesic trajectory starting from position q0 and initial momentum p0
+        Computes the geodesic trajectory starting from position q0 and initial speed v0
 
         Parameters
         ----------
         q0 : torch.Tensor (b, d)
             Initial position
-        p0 : torch.Tensor (b, d)
-            Initial momentum
+        v0 : torch.Tensor (b, d)
+            Initial speed
 
         Returns
         -------
@@ -3483,6 +3510,7 @@ class ExpMapRanders(torch.nn.Module):
         p_t : torch.Tensor (b,T,d)
             Momentum along the geodesic trajectory
         """
+        p0 = self.legendre_transform(q0, v0)
         traj_q, traj_p = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
         return traj_q, traj_p
 
@@ -3525,6 +3553,52 @@ class ExpMapRiemann(torch.nn.Module):
             omega=self.omega,
         )
 
+    def legendre_transform(self, q: Tensor, v: Tensor) -> Tensor:
+        """
+        Convert a speed vector to a momentum vector using the Legendre transform.
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        v : torch.Tensor (b, d)
+            Speed
+
+        Returns
+        -------
+        p : torch.Tensor (b, d)
+            Momentum
+        """
+        G = self.cometric.metric_tensor(q)
+        if self.cometric.is_diag:
+            Gv = G * v
+        else:
+            Gv = torch.einsum("ij,j->i", G, v)
+        return Gv
+
+    def inverse_legendre_transform(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Convert a momentum vector to a speed vector using the inverse Legendre transform.
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        p : torch.Tensor (b, d)
+            Momentum
+
+        Returns
+        -------
+        v : torch.Tensor (b, d)
+            Speed
+        """
+        G_inv = self.cometric.cometric_tensor(q)
+        if self.cometric.is_diag:
+            G_inv_p = G_inv * p
+        else:
+            G_inv_p = torch.einsum("ij,j->i", G_inv, p)
+        return G_inv_p
+
     def H(self, q: Tensor, p: Tensor) -> Tensor:
         """
         Hamiltonian function for the Riemannian manifold.
@@ -3544,16 +3618,16 @@ class ExpMapRiemann(torch.nn.Module):
         H = self.cometric(q, p)
         return 0.5 * H
 
-    def forward(self, q0: Tensor, p0: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, q0: Tensor, v0: Tensor) -> tuple[Tensor, Tensor]:
         """
-        Computes the geodesic trajectory starting from position q0 and initial momentum p0
+        Computes the geodesic trajectory starting from position q0 and initial speed v0
 
         Parameters
         ----------
         q0 : torch.Tensor (b, d)
             Initial position
-        p0 : torch.Tensor (b, d)
-            Initial momentum
+        v0 : torch.Tensor (b, d)
+            Initial speed
 
         Returns
         -------
@@ -3562,6 +3636,7 @@ class ExpMapRiemann(torch.nn.Module):
         p_t : torch.Tensor (b,T,d)
             Momentum along the geodesic trajectory
         """
+        p0 = self.legendre_transform(q0, v0)
         traj_q, traj_p = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
         return traj_q, traj_p
 
