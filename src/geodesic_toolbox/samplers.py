@@ -1338,16 +1338,24 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         The step size for the leapfrog integrator.
     omega : float
         The binding parameter for the leapfrog integrator.
+    substeps : int
+        The number of substeps for the leapfrog integrator.
+        This is the number of times the leapfrog step is applied to the same pair of states (z_0, v_0)
+        and (z_1, v_1) before updating the states. This can be used to improve the stability of the integrator.
     """
 
-    def __init__(self, H: Hamiltonian, gamma: float, omega: float):
+    def __init__(self, H: Hamiltonian, gamma: float, omega: float, substeps: int = 1):
         super().__init__()
         self.H_base = H
+        self.substeps = substeps
         self.gamma = gamma
+        self.step_size = gamma / substeps
         self.omega = omega
 
-        c = torch.Tensor([2 * self.omega * self.gamma]).cos()
-        s = torch.Tensor([2 * self.omega * self.gamma]).sin()
+        # c = torch.Tensor([2 * self.omega * self.gamma]).cos()
+        # s = torch.Tensor([2 * self.omega * self.gamma]).sin()
+        c = torch.Tensor([2 * self.omega * self.step_size]).cos()
+        s = torch.Tensor([2 * self.omega * self.step_size]).sin()
         self.register_buffer("c", c, persistent=False)
         self.register_buffer("s", s, persistent=False)
 
@@ -1440,20 +1448,24 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         c = self.c.to(z_0.device).to(z_0.dtype)
         s = self.s.to(z_0.device).to(z_0.dtype)
 
-        v_0_new = v_0 - self.gamma / 2 * self.dH_dz(z_0, v_1)
-        z_1_new = z_1 + self.gamma / 2 * self.dH_dv(z_0, v_1)
-        v_1_new = v_1 - self.gamma / 2 * self.dH_dz(z_1_new, v_0)
-        z_0_new = z_0 + self.gamma / 2 * self.dH_dv(z_1_new, v_0)
+        v_0_new = v_0 - self.step_size / 2 * self.dH_dz(z_0, v_1)
+        z_1_new = z_1 + self.step_size / 2 * self.dH_dv(z_0, v_1)
+        v_1_new = v_1 - self.step_size / 2 * self.dH_dz(z_1_new, v_0)
+        z_0_new = z_0 + self.step_size / 2 * self.dH_dv(z_1_new, v_0)
 
-        z_0_new = (z_0_new + z_1_new + c * (z_0_new - z_1_new) + s * (v_0_new - v_1_new)) / 2
-        v_0_new = (v_0_new + v_1_new - s * (z_0_new - z_1_new) + c * (v_0_new - v_1_new)) / 2
-        z_1_new = (z_0_new + z_1_new - c * (z_0_new - z_1_new) - s * (v_0_new - v_1_new)) / 2
-        v_1_new = (v_0_new + v_1_new + s * (z_0_new - z_1_new) - c * (v_0_new - v_1_new)) / 2
+        # Apply the binding map simultaneously from the same pre-rotation state.
+        z0_pre, v0_pre = z_0_new, v_0_new
+        z1_pre, v1_pre = z_1_new, v_1_new
 
-        v_1_new = v_1_new - self.gamma / 2 * self.dH_dz(z_1_new, v_0_new)
-        z_0_new = z_0_new + self.gamma / 2 * self.dH_dv(z_1_new, v_0_new)
-        v_0_new = v_0_new - self.gamma / 2 * self.dH_dz(z_0_new, v_1_new)
-        z_1_new = z_1_new + self.gamma / 2 * self.dH_dv(z_0_new, v_1_new)
+        z_0_new = (z0_pre + z1_pre + c * (z0_pre - z1_pre) + s * (v0_pre - v1_pre)) / 2
+        v_0_new = (v0_pre + v1_pre - s * (z0_pre - z1_pre) + c * (v0_pre - v1_pre)) / 2
+        z_1_new = (z0_pre + z1_pre - c * (z0_pre - z1_pre) - s * (v0_pre - v1_pre)) / 2
+        v_1_new = (v0_pre + v1_pre + s * (z0_pre - z1_pre) - c * (v0_pre - v1_pre)) / 2
+
+        v_1_new = v_1_new - self.step_size / 2 * self.dH_dz(z_1_new, v_0_new)
+        z_0_new = z_0_new + self.step_size / 2 * self.dH_dv(z_1_new, v_0_new)
+        v_0_new = v_0_new - self.step_size / 2 * self.dH_dz(z_0_new, v_1_new)
+        z_1_new = z_1_new + self.step_size / 2 * self.dH_dv(z_0_new, v_1_new)
 
         return z_0_new, v_0_new, z_1_new, v_1_new
 
@@ -1465,7 +1477,8 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
             traj_v = [v_0.clone().detach()]
 
         for k in tqdm(range(L)):
-            z_0, v_0, z_1, v_1 = self.leapfrog_step(z_0, v_0, z_1, v_1)
+            for _ in range(self.substeps):
+                z_0, v_0, z_1, v_1 = self.leapfrog_step(z_0, v_0, z_1, v_1)
 
             if return_traj:
                 # Keep graph only on the final point.
