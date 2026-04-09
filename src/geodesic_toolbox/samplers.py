@@ -1471,12 +1471,36 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, z_0: Tensor, v_0: Tensor, L: int, return_traj: bool = False):
+        """
+        Perform L-1 leapfrog steps with the augmented Hamiltonian.
+
+        Parameters
+        ----------
+        z_0 : Tensor (b,d)
+            The initial position.
+        v_0 : Tensor (b,d)            
+            The initial velocity.
+        L : int
+            The number of leapfrog steps to perform.
+        return_traj : bool
+            If True, it returns the trajectory of the samples over the L leapfrog steps.
+
+        Returns
+        -------
+        z_L : Tensor (b,d)
+            The new position after L leapfrog steps.
+        v_L : Tensor (b,d)
+            The new velocity after L leapfrog steps.
+        or
+        (Tensor (b,L,d), Tensor (b,L,d))
+            The trajectory of the positions and velocities over the L leapfrog steps.
+        """
         z_1, v_1 = z_0.clone(), v_0.clone()
         if return_traj:
             traj_z = [z_0.clone().detach()]
             traj_v = [v_0.clone().detach()]
 
-        for k in tqdm(range(L)):
+        for k in tqdm(range(L-1), desc="Leapfrog steps", unit="steps"):
             for _ in range(self.substeps):
                 z_0, v_0, z_1, v_1 = self.leapfrog_step(z_0, v_0, z_1, v_1)
 
