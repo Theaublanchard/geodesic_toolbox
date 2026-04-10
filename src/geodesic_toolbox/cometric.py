@@ -1918,10 +1918,10 @@ class DualRandersMetrics(RandersMetrics):
         G_star = torch.einsum("bi,bj->bij", G_inv_w, G_inv_w)  # (b,d,d)
         if self.primal_randers.base_cometric.is_diag:
             alpha_G_inv = alpha[:, None] * G_inv  # (b,d)
-            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]  # (b,d,d)
+            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]**2  # (b,d,d)
         else:
             alpha_G_inv = alpha[:, None, None] * G_inv  # (b,d,d)
-            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]  # (b,d,d)
+            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]**2  # (b,d,d)
         return G_star
 
     def forward(self, x: Tensor, v: Tensor) -> Tensor:
@@ -1957,10 +1957,10 @@ class DualRandersMetrics(RandersMetrics):
         G_star = torch.einsum("bi,bj->bij", G_inv_w, G_inv_w)  # (b,d,d)
         if self.primal_randers.base_cometric.is_diag:
             alpha_G_inv = alpha[:, None] * G_inv  # (b,d)
-            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]  # (b,d,d)
+            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]**2  # (b,d,d)
         else:
             alpha_G_inv = alpha[:, None, None] * G_inv  # (b,d,d)
-            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]  # (b,d,d)
+            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]**2  # (b,d,d)
 
         v_norm = torch.einsum("bi,bij,bj->b", v, G_star, v).sqrt()  # (b,)
         omega_star_v = torch.einsum("bi,bi->b", omega_star, v)  # (b,)
