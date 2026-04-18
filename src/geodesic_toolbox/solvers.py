@@ -1080,15 +1080,15 @@ class SolverGraph(GeodesicDistanceSolver):
         N_data = data.shape[0]
         _, indices = knn.kneighbors(data.cpu())
         indices = indices[:, 1:]  # Remove the point itself, (N_data, k)
-        A = np.zeros((N_data, N_data), dtype=int)
+        A = torch.zeros((N_data, N_data), dtype=torch.int8)
         batch_idx = torch.arange(N_data).view(-1, 1)
         A[batch_idx, indices] = 1
-        if not is_connected(Graph(A)):
+        if not is_connected(Graph(A.cpu().numpy())):
             print("Adjacency Graph is not connected : connecting ")
             A = self.connect_graph(A)
         # Symetrize the adjacency matrix because why not
-        A = np.maximum(A, A.T)
-        return torch.from_numpy(A), knn
+        A = torch.maximum(A, A.T)
+        return A, knn
 
     @property
     def A(self):
