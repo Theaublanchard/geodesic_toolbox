@@ -990,7 +990,6 @@ class CentroidsCometric(CoMetric):
         If True, the interpolation weights is given by N(c_k,Sigma_k) else it is N(c_k,Id).
     """
 
-    # @TODO : change metric_weight default value to False.
     def __init__(
         self,
         centroids: Tensor = None,
@@ -1178,6 +1177,321 @@ class CentroidsCometric(CoMetric):
 
     def extra_repr(self) -> str:
         return f"K={self.K}, temperature={self.temperature.item():.3f}, temp_scale={self.temperature_scale.item()} reg_coef={self.reg_coef.item():.3f}, metric_weight={self.metric_weight}, is_diag={self.is_diag}"
+
+
+class LANDCometric(CoMetric):
+    """
+    Cometric based on the LAND metric.
+    The cometric is given by:
+    G_inv(x) = diag(h(x)) + reg_coef * Id
+    where h(x) = sum_i (x_i^alpha - x^alpha)^2 exp(-||x_i - x||^2 / (2 * sigma^2))
+    where x_i are the centroids, and alpha is a parameter that controls the shape of the metric.
+
+    Parameters:
+    -----------
+    centroids : Tensor (K,d)
+        The centroids of the clusters
+    alpha : int
+        The alpha parameter of the LAND metric. It controls the shape of the metric. Default to 1.
+    sigma : float
+        The sigma parameter of the LAND metric. It controls the width of the Gaussian kernel. Default to 1.
+    reg_coef : float
+        The regularization coefficient. Default to 1e-5.
+    K: int, Default None
+        If not None, the number of centroids to use, computed by KMedoids clustering
+    """
+
+    def __init__(
+        self,
+        centroids: Tensor,
+        alpha: int = 1,
+        sigma: float = 1.0,
+        reg_coef: float = 1e-5,
+        K: int = None,
+    ):
+        super().__init__(is_diag=True)
+
+        assert (
+            centroids.ndim == 2
+        ), f"Centroids should be of shape (K,d), got {centroids.shape}"
+        assert alpha > 0 and isinstance(
+            alpha, int
+        ), f"Alpha should be a positive integer, got {alpha}"
+        assert sigma > 0, f"Sigma should be a positive float, got {sigma}"
+        assert reg_coef >= 0, f"Reg_coef should be a non-negative float, got {reg_coef}"
+
+        self.register_buffer("centroids", centroids)
+        self.register_buffer("alpha", Tensor([alpha]))
+        self.register_buffer("sigma", Tensor([sigma]))
+        self.register_buffer("reg_coef", Tensor([reg_coef]))
+
+        if K is not None:
+            assert (
+                K > 0 and K <= centroids.shape[0]
+            ), f"K should be in the range (0, {centroids.shape[0]=}], got {K}"
+            self.centroids = self.process_centroids(centroids, K)
+
+        self.K = centroids.shape[0]
+        self.d = centroids.shape[1]
+
+    def process_centroids(self, centroids: Tensor, K: int) -> Tensor:
+        """
+        Compute the K-medoids clustering of the centroids and return the new centroids.
+
+        Parameters:
+        centroids : Tensor (N,d)
+            The original centroids
+        K : int
+            The number of centroids to select
+        """
+        dst_mat = torch.cdist(centroids, centroids, p=2).sqrt().cpu().numpy()
+        kmedoids_model = kmedoids.KMedoids(
+            n_clusters=K, metric="precomputed", random_state=1312
+        )
+        kmedoids_model.fit(dst_mat)
+        centroids_idx = kmedoids_model.medoid_indices_
+        return centroids[centroids_idx]
+
+    def h(self, x: Tensor) -> Tensor:
+        """
+        Computes the h(x) function of the LAND metric.
+
+        Parameters:
+        x : Tensor (B,d)
+            The input points
+
+        Returns:
+        Tensor (B,)
+            The computed h(x) values
+        """
+        x_alpha = x**self.alpha  # (B,d)
+        centroids_alpha = self.centroids**self.alpha  # (K,d)
+        diff = x_alpha[:, None, :] - centroids_alpha[None, :, :]  # (B,K,d)
+        dst = torch.cdist(x, self.centroids, p=2)  # (B,K)
+        weights = torch.exp(-(dst**2) / (2 * self.sigma**2))  # (B,K)
+        h_x = weights[:, :, None] * (diff**2)  # (B,K,d)
+        h_x = h_x.sum(dim=1)  # (B,d)
+        return h_x
+
+    def forward(self, x: Tensor) -> Tensor:
+        h_x = self.h(x)
+        G_inv = h_x + self.reg_coef * self.eye(x)
+        return G_inv
+
+    def extra_repr(self) -> str:
+        return f"K={self.K}, alpha={self.alpha.item()}, sigma={self.sigma.item()}, reg_coef={self.reg_coef.item()}"
+
+
+class RBFCometric(CoMetric):
+    """
+    Cometric based on the RBF kernel.
+    The cometric is given by:
+    G_inv(x) = diag(h(x)) + reg_coef * Id
+    where h(x) = sum_k w_k exp(- lambda_k /2 * ||x - c_k||^alpha)
+    where c_k are the centroids, and lambda_k are the bandwidths of the RBF kernels.
+    The weights w_k can be learned or fixed to 1/K.
+
+    Parameters:
+    -----------
+    centroids : Tensor (K,d)
+        The centroids of the clusters
+    K: int
+        The number of centroids to use. Computed using KMeans.
+    kappa : float. Default to 1.0.
+        The scaling factor for the bandwidths of the RBF kernels.
+    reg_coef : float. Default to 1e-3.
+        The regularization coefficient.
+    learn_weights : bool. Default to False.
+        Whether to learn the weights w_k of the RBF kernels. If False, they are fixed to 1/K.
+    """
+
+    def __init__(
+        self,
+        data: Tensor,
+        K: int,
+        kappa: float = 1.0,
+        reg_coef: float = 1e-3,
+        learn_weights: bool = False,
+    ):
+        super().__init__(is_diag=True)
+
+        assert data.ndim == 2, f"data should be of shape (N,d), got {data.shape}"
+        assert reg_coef >= 0, f"Reg_coef should be a non-negative float, got {reg_coef}"
+        assert (
+            K > 0 and K <= data.shape[0]
+        ), f"K should be in the range (0, {data.shape[0]=}], got {K}"
+        assert kappa > 0, f"kappa should be a positive float, got {kappa}"
+
+        self.register_buffer("reg_coef", Tensor([reg_coef]))
+        self.register_buffer("kappa", Tensor([kappa]))
+
+        centroids_, new_K = self.process_centroids(data, K)
+        self.register_buffer("centroids", centroids_)
+        self.K = new_K
+
+        bandwidths = self.compute_bandwidths(data, centroids_, kappa)
+        self.register_buffer("bandwidths", bandwidths)
+
+        # w_k parameter
+        self.register_buffer("w", torch.ones(self.K) / self.K)
+        self.w = nn.Parameter(self.w, requires_grad=learn_weights)
+        if learn_weights:
+            self.learn_w(data)
+
+    def process_centroids(self, data: Tensor, K: int):
+        """
+        Process the centroids to select K representative centroids using K-Means clustering.
+
+        Parameters:
+        data : Tensor (N,d)
+            The original data points, used to compute the clusters of centroids
+        K : int
+            The number of centroids to select.
+        """
+        kmeans = KMeans(n_clusters=K, random_state=1312)
+        kmeans.fit(data.cpu().numpy())
+        centroids = torch.from_numpy(kmeans.cluster_centers_).to(data.device, dtype=data.dtype)
+        new_K = centroids.shape[0]
+        return centroids, new_K
+
+    def compute_bandwidths(
+        self,
+        data: Tensor,
+        centroids: Tensor,
+        kappa: Tensor,
+        min_cluster_size: int = 3,
+        neighbor_rank: int = 5,
+        min_scale_quantile: float = 0.25,
+        max_scale_quantile: float = 0.95,
+        eps: float = 1e-12,
+    ) -> Tensor:
+        """
+        # Compute the bandwidths of the RBF kernels as :
+        # lambda_k = 1/2 * (kappa / Card(C_k) * sum_{c_j in C_k} ||c_k - c_j||^2) ^ (-2)
+        # where C_k is the cluster of centroids closest to c_k.
+
+        Compute the bandwidths of the RBF kernels.
+        The initial guess is given by the local in-cluster scale, which is the average
+        squared distance from each centroid to the points in its cluster.
+        To prevent pathological cases when the cluster cardinality is very small, we blend
+        this local scale with a more robust scale based on the distance to neighboring centroids.
+
+        Parameters:
+        -----------
+        data : Tensor (N,d)
+            The original data points, used to compute the clusters of centroids
+        centroids : Tensor (K,d)
+            The centroids of the clusters
+        kappa : Tensor
+            The scaling factor for the bandwidths
+
+        Returns:
+        bandwidths : Tensor (K,)
+            The computed bandwidths for each centroid
+        """
+        K = centroids.shape[0]
+
+        if K == 1:
+            dist2 = torch.cdist(centroids, data, p=2).pow(2).mean().clamp_min(eps)
+            return torch.tensor(
+                [0.5 / (kappa * kappa * dist2)],
+                device=centroids.device,
+                dtype=centroids.dtype,
+            )
+
+        # Assign each sample to the closest centroid.
+        dst_data = torch.cdist(centroids, data, p=2)  # (K,N)
+        closest_centroid = dst_data.argmin(dim=0)  # (N,)
+
+        # Robust fallback scale from centroid geometry.
+        # Use a higher-order neighbor to avoid over-peaked kernels when K is large.
+        dst_centroids = torch.cdist(centroids, centroids, p=2)
+        dst_centroids.fill_diagonal_(float("inf"))
+        sorted_dst, _ = torch.sort(dst_centroids, dim=1)
+        rank = min(max(neighbor_rank - 1, 0), max(K - 2, 0))
+        nn_dist = sorted_dst[:, rank]  # (K,)
+        nn_scale2 = nn_dist.pow(2).clamp_min(eps)
+
+        # Global robust floor/ceiling so outlier clusters do not dominate smoothness.
+        min_scale2 = torch.quantile(nn_scale2, min_scale_quantile).clamp_min(eps)
+        max_scale2 = torch.quantile(nn_scale2, max_scale_quantile).clamp_min(eps)
+        nn_scale2 = nn_scale2.clamp(min=min_scale2, max=max_scale2)
+
+        # Local in-cluster scale. May be unreliable when cluster cardinality is very small.
+        local_scale2 = torch.zeros(K, device=centroids.device, dtype=centroids.dtype)
+        counts = torch.bincount(closest_centroid, minlength=K).to(centroids.dtype)
+        for k in range(K):
+            cluster_points = data[closest_centroid == k]  # (Card(C_k),d)
+            if cluster_points.shape[0] > 0:
+                c_k = centroids[k : k + 1]
+                dist2 = torch.cdist(c_k, cluster_points, p=2).pow(2)
+                local_scale2[k] = dist2.mean().clamp_min(eps)
+
+        # Blend local scale with centroid-neighborhood scale.
+        # For small clusters (K ~ N), this prevents pathological very narrow kernels.
+        reliability = ((counts - 1) / max(min_cluster_size - 1, 1)).clamp(0.0, 1.0)
+        scale2 = reliability * local_scale2 + (1.0 - reliability) * nn_scale2
+        scale2 = scale2.clamp(min=min_scale2, max=max_scale2)
+
+        bandwidths = 0.5 / (kappa * kappa * scale2)
+
+        # Fix any potential numerical issues with the bandwidths
+        if not torch.isfinite(bandwidths).all():
+            finite_mask = torch.isfinite(bandwidths)
+            if finite_mask.any():
+                fill_value = bandwidths[finite_mask].median()
+            else:
+                fill_value = torch.tensor(
+                    1.0, device=bandwidths.device, dtype=bandwidths.dtype
+                )
+            bandwidths = torch.where(finite_mask, bandwidths, fill_value)
+        return bandwidths
+
+    def learn_w(self, data: Tensor, n_iters: int = 100) -> None:
+        """
+        Learn the weights w_k of the RBF kernels by minimizing the mean squared error between the cometric at the centroids and the cometric given by the RBF interpolation at the centroids.
+        """
+        optimizer = torch.optim.Adam([self.w], lr=1e-2)
+        loss_list = []
+        pbar = tqdm(range(n_iters), desc="Learning RBF weights", leave=False)
+        for _ in pbar:
+            optimizer.zero_grad()
+            h_x = self.h(data)  # (N,)
+            loss = (1 - h_x).pow(2).mean()
+            loss.backward()
+            optimizer.step()
+            loss_list.append(loss.item())
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        print(f"Learned weights w. Final loss: {loss_list[-1]:.4f}")
+
+    def h(self, x: Tensor) -> Tensor:
+        """
+        Computes the h(x) function of the RBF cometric.
+
+        Parameters:
+        x : Tensor (B,d)
+            The input points
+
+        Returns:
+        Tensor (B,)
+            The computed h(x) values
+        """
+        dst = torch.cdist(x, self.centroids, p=2)  # (B,K)
+        # To avoid numerical issues when bandwidths are inf and dst is zero
+        # We set the corresponding rbf value to 1 in this case
+        # which means that the RBF kernel is constant and doesn't contribute to the metric
+        rbf = self.bandwidths[None, :] * (dst**2)  # (B,K)
+        rbf = torch.exp(-rbf / 2)
+        # Set the RBF values to 1 where the bandwidth is infinite
+        rbf = torch.where(torch.isinf(self.bandwidths[None, :]), torch.ones_like(rbf), rbf)
+        # Keep mixture weights positive and normalized.
+        h_x = torch.einsum("k,bk->b", self.w, rbf)  # (B,)
+        return h_x
+
+    def forward(self, x: Tensor) -> Tensor:
+        h_x = self.h(x)[:, None]  # (B,1)
+        G_inv = h_x.expand(-1, x.shape[1]) + self.reg_coef * self.eye(x)  # (B,d)
+        return G_inv
 
 
 #################################################################
@@ -1918,10 +2232,12 @@ class DualRandersMetrics(RandersMetrics):
         G_star = torch.einsum("bi,bj->bij", G_inv_w, G_inv_w)  # (b,d,d)
         if self.primal_randers.base_cometric.is_diag:
             alpha_G_inv = alpha[:, None] * G_inv  # (b,d)
-            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]**2  # (b,d,d)
+            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[
+                :, None, None
+            ] ** 2  # (b,d,d)
         else:
             alpha_G_inv = alpha[:, None, None] * G_inv  # (b,d,d)
-            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]**2  # (b,d,d)
+            G_star = (G_star + alpha_G_inv) / alpha[:, None, None] ** 2  # (b,d,d)
         return G_star
 
     def forward(self, x: Tensor, v: Tensor) -> Tensor:
@@ -1957,10 +2273,12 @@ class DualRandersMetrics(RandersMetrics):
         G_star = torch.einsum("bi,bj->bij", G_inv_w, G_inv_w)  # (b,d,d)
         if self.primal_randers.base_cometric.is_diag:
             alpha_G_inv = alpha[:, None] * G_inv  # (b,d)
-            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[:, None, None]**2  # (b,d,d)
+            G_star = (G_star + torch.diag_embed(alpha_G_inv)) / alpha[
+                :, None, None
+            ] ** 2  # (b,d,d)
         else:
             alpha_G_inv = alpha[:, None, None] * G_inv  # (b,d,d)
-            G_star = (G_star + alpha_G_inv) / alpha[:, None, None]**2  # (b,d,d)
+            G_star = (G_star + alpha_G_inv) / alpha[:, None, None] ** 2  # (b,d,d)
 
         v_norm = torch.einsum("bi,bij,bj->b", v, G_star, v).sqrt()  # (b,)
         omega_star_v = torch.einsum("bi,bi->b", omega_star, v)  # (b,)
