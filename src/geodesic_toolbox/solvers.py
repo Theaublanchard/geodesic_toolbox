@@ -2599,17 +2599,14 @@ class GEORCE(GeodesicDistanceSolver):
             G_inv_t = torch.cat(
                 [G_inv_0[None, :], G_inv_t], dim=0
             )  # (T-1, d, d) | (T-1, d, d)
-            if G_inv_t.ndim == 3:
-                G_t = G_inv_t.inverse()  # (T-1, d, d)
-            else:
-                G_t = 1 / G_inv_t  # (T-1,d)
 
             # L6
             if G_inv_t.ndim == 3:
-                v_t = torch.einsum(
-                    "tj, tji, ti -> tj", u_t_i[1:], G_t[1:], u_t_i[1:]
-                )  # (T-2, d)
+                # Avoid explicit inverse: solve G_inv * x = u, then use u * x.
+                G_u = torch.linalg.solve(G_inv_t[1:], u_t_i[1:].unsqueeze(-1)).squeeze(-1)
+                v_t = u_t_i[1:] * G_u  # (T-2, d)
             else:
+                G_t = 1 / G_inv_t  # (T-1,d)
                 v_t = u_t_i[1:] * G_t[1:] * u_t_i[1:]  # (T-2, d)
             v_t = torch.autograd.grad(
                 v_t.sum(),
@@ -3467,9 +3464,9 @@ class ExpMapRanders(torch.nn.Module):
         alpha = self.randers.base_cometric.metric(q, v).sqrt()[:, None]
         omega = self.randers.omega(q) * self.randers.beta
         G = self.randers.base_cometric.metric_tensor(q)
-        if self.randers.base_cometric.is_diag: # (b, d)
+        if self.randers.base_cometric.is_diag:  # (b, d)
             Gv = G * v
-        else: # (b, d, d)
+        else:  # (b, d, d)
             Gv = torch.einsum("bij,bj->bi", G, v)
         p = f * (Gv / alpha + omega)
         return p
