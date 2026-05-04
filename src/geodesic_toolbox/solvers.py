@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch import Tensor
 from math import ceil
+from dataclasses import dataclass, field
 from einops import rearrange
 from collections.abc import Callable
 from scipy.integrate import solve_bvp
@@ -2308,6 +2309,37 @@ class SolverGraphFinsler(torch.nn.Module):
         return dst
 
 
+@dataclass
+class GEORCELineSearchStats:
+    initial_energy: float
+    final_energy: float
+    num_iterations: int
+    accepted: bool
+
+
+@dataclass
+class GEORCEIterationStats:
+    iteration: int
+    grad_norm: float
+    distance: float
+    energy: float
+    alpha: float
+    line_search: GEORCELineSearchStats
+
+
+@dataclass
+class GEORCERunStats:
+    initial_distance: float | None
+    initial_energy: float | None
+    final_distance: float | None
+    final_energy: float | None
+    final_grad_norm: float | None
+    converged: bool
+    iterations: list[GEORCEIterationStats] = field(default_factory=list)
+    line_search_warnings: int = 0
+    n_iter: int = 0
+
+
 class GEORCE(GeodesicDistanceSolver):
     """
     Computes the geodesic distances between points using the GEORCE algorithm.
@@ -2324,6 +2356,8 @@ class GEORCE(GeodesicDistanceSolver):
         The number of time steps to use for the geodesic trajectory.
     max_iter : int
         The maximum number of iterations to perform in the optimization.
+    line_search_iter : int
+        The maximum number of iterations to perform in the line search.
     tol : float
         The tolerance for the optimization. If the norm of the energy
         gradient is below this value, the optimization stops.
@@ -2342,6 +2376,7 @@ class GEORCE(GeodesicDistanceSolver):
         cometric: CoMetric,
         T=100,
         max_iter=200,
+        line_search_iter: int = 50,
         tol=1e-6,
         rho=0.5,
         c=0.9,
@@ -2357,8 +2392,11 @@ class GEORCE(GeodesicDistanceSolver):
         self.c = c
         self.alpha_0 = alpha_0
         self.pbar = pbar
+        self.line_search_iter = line_search_iter
 
-    def compute_energy(self, z_t, z0, zT):
+        self.georce_stats: GEORCERunStats | None = None
+
+    def compute_energy(self, z_t: Tensor, z0: Tensor, zT: Tensor) -> Tensor:
         """
         Compute the energy of the geodesic trajectory.
 
@@ -2378,11 +2416,9 @@ class GEORCE(GeodesicDistanceSolver):
         traj = torch.cat([z0[None, :], z_t, zT[None, :]], dim=0)  # (T+1, d)
         dx = traj[1:] - traj[:-1]  # (T, d)
         energy = self.cometric.metric(traj[:-1], dx)
-        # G = self.cometric.metric_tensor(traj[:-1])  # (T, d, d)
-        # energy = torch.einsum("ti,tij,tj->t", dx, G, dx)  # (T,)
         return energy.sum()
 
-    def grad_E(self, z_t, z0, zT):
+    def grad_E(self, z_t: Tensor, z0: Tensor, zT: Tensor) -> Tensor:
         """
         Compute the gradient of the energy with respect to the trajectory points.
 
@@ -2404,7 +2440,11 @@ class GEORCE(GeodesicDistanceSolver):
         E = self.compute_energy(z_t, z0, zT)
         return torch.autograd.grad(E, z_t, materialize_grads=True)[0]
 
-    def get_mut_t(self, v_t, G_inv_t, diff):
+    def _energy_grad_norm(self, grad_E_t: Tensor) -> Tensor:
+        """Compute normalized gradient norm used for GEORCE stopping criteria."""
+        return torch.linalg.vector_norm(grad_E_t.reshape(-1)) / grad_E_t.numel()
+
+    def get_mut_t(self, v_t: Tensor, G_inv_t: Tensor, diff: Tensor) -> Tensor:
         """
         Compute the optimal mu_t for the given v_t and G_inv_t.
         Broadly corresponds to line 7.
@@ -2439,7 +2479,7 @@ class GEORCE(GeodesicDistanceSolver):
         mu_t = torch.cat([mu_T[None, :] + v_cumsum, mu_T[None, :]], dim=0)  # (T, d)
         return mu_t  # (T, d)
 
-    def line_search(self, x_0, x_T, u_t, u_t_i, x_t_i):
+    def line_search(self, x_0, x_T, u_t, u_t_i, x_t_i) -> tuple[float, GEORCELineSearchStats]:
         """
         Perform a Armiijo's line search to find the optimal step size alpha.
 
@@ -2460,6 +2500,8 @@ class GEORCE(GeodesicDistanceSolver):
         -------
         alpha: float
             The optimal step size found by the line search.
+        stats: GEORCELineSearchStats
+            The statistics of the line search, including initial and final energy, number of iterations, and whether the step size was accepted.
         """
         # Compute the initial energy
         E_0 = self.compute_energy(x_t_i, x_0, x_T)
@@ -2479,7 +2521,7 @@ class GEORCE(GeodesicDistanceSolver):
         val = E_0 + self.c * alpha * torch.dot(grad_E_0, p_k)
         condition = E_new > val
 
-        while condition and curr_iter < self.max_iter:
+        while condition and curr_iter < self.line_search_iter:
             alpha *= self.rho  # Reduce step size
             curr_iter += 1
 
@@ -2491,12 +2533,16 @@ class GEORCE(GeodesicDistanceSolver):
             val = E_0 + self.c * alpha * torch.dot(grad_E_0, p_k)
             condition = E_new > val
 
-        if curr_iter == self.max_iter:
-            print(f"Warning: Maximum iterations reached in line search. {alpha=}")
+        stats = GEORCELineSearchStats(
+            initial_energy=E_0.detach().item(),
+            final_energy=E_new.detach().item(),
+            num_iterations=curr_iter,
+            accepted=curr_iter < self.line_search_iter,
+        )
 
-        return alpha
+        return alpha, stats
 
-    def dst_func(self, x_0, x_T, x_t) -> Tensor:
+    def dst_func(self, x_0: Tensor, x_T: Tensor, x_t: Tensor) -> Tensor:
         """
         Compute the geodesic distance between x_0 and x_T along the trajectory x_t.
 
@@ -2524,7 +2570,7 @@ class GEORCE(GeodesicDistanceSolver):
         x_0: Tensor,
         x_T: Tensor,
         x_t_0: Tensor = None,
-    ):
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Solve the geodesic equation using the GEORCE algorithm.
 
@@ -2555,6 +2601,17 @@ class GEORCE(GeodesicDistanceSolver):
         # Initialize everything
         i = 0
         d = x_0.shape[0]
+        self.georce_stats = GEORCERunStats(
+            initial_distance=None,
+            initial_energy=None,
+            final_distance=None,
+            final_energy=None,
+            final_grad_norm=None,
+            converged=False,
+            iterations=[],
+            line_search_warnings=0,
+            n_iter=0,
+        )
 
         if x_t_0 is None:
             t = torch.linspace(0, 1, self.T, device=x_0.device, dtype=x_0.dtype)
@@ -2563,7 +2620,7 @@ class GEORCE(GeodesicDistanceSolver):
             assert x_t_0.shape == (
                 self.T - 2,
                 d,
-            ), f"x_t_0 must have shape {(self.T - 2, d)=} got {x_t_0.shape=}. But sure to exclude x_0 and x_T."
+            ), f"x_t_0 must have shape {(self.T - 2, d)=} got {x_t_0.shape=}. Be sure to exclude x_0 and x_T."
 
         # Precompute cometric at start without building graph
         with torch.no_grad():
@@ -2578,20 +2635,21 @@ class GEORCE(GeodesicDistanceSolver):
 
         # L4
         grad_E_t = self.grad_E(x_t_i, x_0, x_T)
-        norm_grad_E_t = torch.linalg.vector_norm(grad_E_t.reshape(-1))
-        norm_grad_E_t = norm_grad_E_t / (
-            grad_E_t.shape[0] * grad_E_t.shape[1]
-        )  # Normalize by the dimension
+        norm_grad_E_t = self._energy_grad_norm(grad_E_t)
 
         with torch.no_grad():
-            dst_list = [self.dst_func(x_0, x_T, x_t_i).item()]
+            initial_distance = self.dst_func(x_0, x_T, x_t_i).item()
+            initial_energy = self.compute_energy(x_t_i, x_0, x_T).item()
+        dst_list = [initial_distance]
         norm_gE_list = [norm_grad_E_t.item()]
-        with torch.no_grad():
-            E_list = [self.compute_energy(x_t_i, x_0, x_T).item()]
-        alpha_list = [1.0]
+        E_list = [initial_energy]
+        alpha_list = [self.alpha_0]
+
+        self.georce_stats.initial_distance = initial_distance
+        self.georce_stats.initial_energy = initial_energy
 
         if self.pbar:
-            pbar = tqdm(range(self.max_iter), total=self.max_iter, desc="Iterations")
+            pbar = tqdm(range(self.max_iter), total=self.max_iter, desc="GEORCE")
         # for i in pbar:
         while (norm_grad_E_t > self.tol) & (i < self.max_iter):
             # L5
@@ -2623,8 +2681,10 @@ class GEORCE(GeodesicDistanceSolver):
             else:
                 u_t = -0.5 * G_inv_t * mu_t  # (T-1, d)
             # L9/19
-            alpha = self.line_search(x_0, x_T, u_t, u_t_i, x_t_i)
-            # alpha = 0.1
+            alpha, ls_stats = self.line_search(x_0, x_T, u_t, u_t_i, x_t_i)
+
+            if not ls_stats.accepted:
+                self.georce_stats.line_search_warnings += 1
 
             # L11/L12: update state without tracking to avoid graph growth
             with torch.no_grad():
@@ -2635,10 +2695,7 @@ class GEORCE(GeodesicDistanceSolver):
 
             # Prepare stop condition, ie L4
             grad_E_t = self.grad_E(x_t_i, x_0, x_T)
-            norm_grad_E_t = torch.linalg.vector_norm(grad_E_t.reshape(-1))
-            norm_grad_E_t = norm_grad_E_t / (
-                grad_E_t.shape[0] * grad_E_t.shape[1]
-            )  # Normalize by the dimension
+            norm_grad_E_t = self._energy_grad_norm(grad_E_t)
             i += 1
 
             # Logging
@@ -2650,15 +2707,27 @@ class GEORCE(GeodesicDistanceSolver):
             E_list.append(E)
             alpha_list.append(alpha)
 
+            iter_stats = GEORCEIterationStats(
+                iteration=i,
+                grad_norm=norm_grad_E_t.item(),
+                distance=dst,
+                energy=E,
+                alpha=alpha,
+                line_search=ls_stats,
+            )
+            self.georce_stats.iterations.append(iter_stats)
+
             if self.pbar:
                 pbar.set_description(
-                    f"{i=:0>3} |"
-                    f" alpha: {alpha:.3E}, "
-                    f"E = {E:.3E}, "
-                    f"grad_E = {norm_grad_E_t.item():.3E}, "
-                    f" dst = {dst:.3E}"
+                    f"iter={i:0>3} alpha={alpha:.3E} E={E:.3E} grad={norm_grad_E_t.item():.3E} dst={dst:.3E}"
                 )
                 pbar.update(1)
+
+        self.georce_stats.final_distance = dst_list[-1]
+        self.georce_stats.final_energy = E_list[-1]
+        self.georce_stats.final_grad_norm = norm_gE_list[-1]
+        self.georce_stats.n_iter = i
+        self.georce_stats.converged = bool(norm_grad_E_t <= self.tol)
 
         x_final = torch.cat([x_0[None, :], x_t_i, x_T[None, :]], dim=0)  # (T, d)
         dst_list = torch.tensor(dst_list)
@@ -2756,6 +2825,8 @@ class GEORCEFinsler(torch.nn.Module):
         The number of time steps to use for the geodesic trajectory.
     max_iter : int
         The maximum number of iterations to perform in the optimization.
+    line_search_iter : int
+        The maximum number of iterations to perform in the line search.
     tol : float
         The tolerance for the optimization. If the norm of the energy
         gradient is below this value, the optimization stops.
@@ -2774,6 +2845,7 @@ class GEORCEFinsler(torch.nn.Module):
         finsler: FinslerMetric,
         T=100,
         max_iter=200,
+        line_search_iter: int = 50,
         tol=1e-6,
         rho=0.5,
         c=0.9,
@@ -2784,13 +2856,15 @@ class GEORCEFinsler(torch.nn.Module):
         self.finsler = finsler
         self.T = T
         self.max_iter = max_iter
+        self.line_search_iter = line_search_iter
         self.tol = tol
         self.rho = rho
         self.c = c
         self.alpha_0 = alpha_0
         self.pbar = pbar
+        self.georce_finsler_stats: GEORCERunStats | None = None
 
-    def compute_distance(self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None):
+    def compute_distance(self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None) -> torch.Tensor:
         """Given a trajectory and the tangent vectors, compute the distance
         under the finsler metric.
 
@@ -2817,7 +2891,7 @@ class GEORCEFinsler(torch.nn.Module):
         distances = distances.relu().sum(dim=1)  # (B,)
         return distances
 
-    def compute_energy(self, z_t, z0, zT, dx=None):
+    def compute_energy(self, z_t: Tensor, z0: Tensor, zT: Tensor, dx=None) -> Tensor:
         """
         Compute the energy of the geodesic trajectory.
 
@@ -2840,11 +2914,10 @@ class GEORCEFinsler(torch.nn.Module):
         traj = torch.cat([z0[None, :], z_t, zT[None, :]], dim=0)  # (T, d)
         if dx is None:
             dx = traj[1:] - traj[:-1]  # (T-1, d)
-        G = self.finsler.fundamental_tensor(traj[:-1], dx)  # (T-1, d, d)
-        energy = torch.einsum("ti,tij,tj->t", dx, G, dx)  # (T-1,)
+        energy = self.finsler(traj[:-1], dx) ** 2  # (T-1,)
         return energy.sum()
 
-    def dot_sum(self, x_t, u_t):
+    def dot_sum(self, x_t: Tensor, u_t: Tensor) -> Tensor:
         """
         Compute the sum of the dot product of the velocity with the fundamental tensor.
 
@@ -2864,7 +2937,7 @@ class GEORCEFinsler(torch.nn.Module):
         dot = torch.einsum("ti,tij,tj->t", u_t, G_t, u_t)
         return dot.sum()
 
-    def dot_sum_u(self, x_t, u_t_0, u_t_1):
+    def dot_sum_u(self, x_t: Tensor, u_t_0: Tensor, u_t_1: Tensor) -> Tensor:
         """
         Compute the sum of the dot product of the velocity with the fundamental tensor.
         The fundamental tensor is computed at the points x_t with the velocities u_t_0.
@@ -2888,7 +2961,7 @@ class GEORCEFinsler(torch.nn.Module):
         dot = torch.einsum("ti,tij,tj->t", u_t_1, G_t, u_t_1)
         return dot.sum()
 
-    def get_v_t(self, x_t_i, u_t_i):
+    def get_v_t(self, x_t_i: Tensor, u_t_i: Tensor) -> Tensor:
         """
         Compute the gradient of the energy with respect to the trajectory points.
 
@@ -2909,7 +2982,7 @@ class GEORCEFinsler(torch.nn.Module):
         v_t = v_t_func(x_t_i, u_t_i)[0]
         return v_t
 
-    def get_zeta_t(self, x_t_i, u_t_i):
+    def get_zeta_t(self, x_t_i: Tensor, u_t_i: Tensor) -> Tensor:
         """
         Compute the gradient of the energy with respect to the velocity.
         Parameters:
@@ -2928,7 +3001,7 @@ class GEORCEFinsler(torch.nn.Module):
         zeta_t = zeta_t_func(x_t_i, u_t_i, u_t_i)[0]
         return zeta_t
 
-    def get_mut_t(self, v_t, zeta_t, G_inv_t, diff):
+    def get_mut_t(self, v_t: Tensor, zeta_t: Tensor, G_inv_t: Tensor, diff: Tensor) -> Tensor:
         """
         Compute the optimal mu_t for the given v_t and G_inv_t.
         Broadly corresponds to line 8.
@@ -2959,7 +3032,11 @@ class GEORCEFinsler(torch.nn.Module):
         mu_t = torch.cat([mu_T[None, :] + v_cumsum + zeta_t, mu_T[None, :]], dim=0)  # (T, d)
         return mu_t  # (T, d)
 
-    def line_search(self, x_0, x_T, u_t, u_t_i, x_t_i):
+    def _energy_grad_norm(self, grad_E_t: Tensor) -> Tensor:
+        """Compute normalized gradient norm used for GEORCE stopping criteria."""
+        return torch.linalg.vector_norm(grad_E_t.reshape(-1)) / grad_E_t.numel()
+
+    def line_search(self, x_0: Tensor, x_T: Tensor, u_t: Tensor, u_t_i: Tensor, x_t_i: Tensor) -> tuple[float, GEORCELineSearchStats]:
         """
         Perform a Armiijo's line search to find the optimal step size alpha.
 
@@ -2980,6 +3057,8 @@ class GEORCEFinsler(torch.nn.Module):
         -------
         alpha: float
             The optimal step size found by the line search.
+        stats: GEORCELineSearchStats
+            The statistics of the line search, including initial and final energy, number of iterations, and whether the step size was accepted.
         """
         # Compute the initial energy
         E_0 = self.compute_energy(x_t_i, x_0, x_T)
@@ -2999,7 +3078,7 @@ class GEORCEFinsler(torch.nn.Module):
         val = E_0 + self.c * alpha * torch.dot(grad_E_0, p_k)
         condition = E_new > val
 
-        while condition and curr_iter < self.max_iter:
+        while condition and curr_iter < self.line_search_iter:
             alpha *= self.rho  # Reduce step size
             curr_iter += 1
 
@@ -3011,12 +3090,16 @@ class GEORCEFinsler(torch.nn.Module):
             val = E_0 + self.c * alpha * torch.dot(grad_E_0, p_k)
             condition = E_new > val
 
-        if curr_iter == self.max_iter:
-            print(f"Warning: Maximum iterations reached in line search. {alpha=}")
+        stats = GEORCELineSearchStats(
+            initial_energy=E_0.detach().item(),
+            final_energy=E_new.detach().item(),
+            num_iterations=curr_iter,
+            accepted=curr_iter < self.line_search_iter,
+        )
 
-        return alpha
+        return alpha, stats
 
-    def dst_func(self, x_0, x_T, x_t) -> Tensor:
+    def dst_func(self, x_0: Tensor, x_T: Tensor, x_t: Tensor) -> Tensor:
         """
         Compute the geodesic distance between x_0 and x_T along the trajectory x_t.
 
@@ -3036,8 +3119,7 @@ class GEORCEFinsler(torch.nn.Module):
         """
         full_traj = torch.cat([x_0[None, :], x_t, x_T[None, :]], dim=0)  # (T, d)
         dx = full_traj[1:] - full_traj[:-1]  # (T-1, d)
-        G = self.finsler.fundamental_tensor(full_traj[:-1], dx)  # (T-1, d, d)
-        distance = torch.einsum("ti,tij,tj->t", dx, G, dx).abs().sqrt()  # (T-1,)
+        distance = self.finsler(full_traj[:-1], dx).abs()  # (T-1,)
         return distance.sum()
 
     def georce_solver(
@@ -3045,7 +3127,7 @@ class GEORCEFinsler(torch.nn.Module):
         x_0: Tensor,
         x_T: Tensor,
         x_t_0: Tensor = None,
-    ):
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Solve the geodesic equation using the GEORCE algorithm.
 
@@ -3077,6 +3159,18 @@ class GEORCEFinsler(torch.nn.Module):
         i = 0
         d = x_0.shape[0]
 
+        self.georce_stats = GEORCERunStats(
+            initial_distance=None,
+            initial_energy=None,
+            final_distance=None,
+            final_energy=None,
+            final_grad_norm=None,
+            converged=False,
+            iterations=[],
+            line_search_warnings=0,
+            n_iter=0,
+        )
+
         if x_t_0 is None:
             t = torch.linspace(0, 1, self.T, device=x_0.device, dtype=x_0.dtype)
             x_t_0 = x_0[None, :] + t[1:-1, None] * (x_T - x_0)[None, :]  # (T-2, d)
@@ -3084,7 +3178,7 @@ class GEORCEFinsler(torch.nn.Module):
             assert x_t_0.shape == (
                 self.T - 2,
                 d,
-            ), f"x_t_0 must have shape {(self.T - 2, d)=} got {x_t_0.shape=}. But sure to exclude x_0 and x_T."
+            ), f"x_t_0 must have shape {(self.T - 2, d)=} got {x_t_0.shape=}. Be sure to exclude x_0 and x_T."
 
         diff = x_T - x_0
         # (T-2, d), not including x_0 and x_T
@@ -3106,22 +3200,27 @@ class GEORCEFinsler(torch.nn.Module):
         )[
             0
         ]  # (T-1, d)
-        norm_grad_E_t = torch.linalg.vector_norm(grad_E_t.reshape(-1))
-        norm_grad_E_t = norm_grad_E_t / (
-            grad_E_t.shape[0] * grad_E_t.shape[1]
-        )  # Normalize by the dimension
+        norm_grad_E_t = self._energy_grad_norm(grad_E_t)
+        norm_grad_E_before = norm_grad_E_t.clone()
 
         with torch.no_grad():
-            dst_list = [self.dst_func(x_0, x_T, x_t_i).item()]
+            initial_distance = self.dst_func(x_0, x_T, x_t_i).item()
+            initial_energy = self.compute_energy(x_t_i, x_0, x_T).item()
+        dst_list = [initial_distance]
         norm_gE_list = [norm_grad_E_t.item()]
-        with torch.no_grad():
-            E_list = [self.compute_energy(x_t_i, x_0, x_T, dx=u_t_i).item()]
-        alpha_list = [1.0]
+        E_list = [initial_energy]
+        alpha_list = [self.alpha_0]
+
+        self.georce_stats.initial_distance = initial_distance
+        self.georce_stats.initial_energy = initial_energy
 
         if self.pbar:
-            pbar = tqdm(range(self.max_iter), total=self.max_iter, desc="Iterations")
-        # for i in pbar:
+            pbar = tqdm(range(self.max_iter), total=self.max_iter, desc="GEORCE")
+
+        # while (norm_grad_E_t > self.tol) and (i < self.max_iter) and (norm_grad_E_t / (norm_grad_E_before + 1e-8) > 1e-3):
         while (norm_grad_E_t > self.tol) & (i < self.max_iter):
+            norm_grad_E_before = norm_grad_E_t.clone()
+
             # L5
             G_t = self.finsler.fundamental_tensor(x_t_i, u_t_i[1:])  # (T-2, d, d)
             G_t = torch.cat([G_0[None, :], G_t], dim=0)  # (T-1, d, d)
@@ -3138,8 +3237,10 @@ class GEORCEFinsler(torch.nn.Module):
             u_t = -0.5 * torch.einsum("tij,tj->ti", G_inv_t, mu_t)  # (T-1, d)
 
             # L10/11
-            alpha = self.line_search(x_0, x_T, u_t, u_t_i, x_t_i)
-            # alpha = 0.00001
+            alpha, ls_stats = self.line_search(x_0, x_T, u_t, u_t_i, x_t_i)
+
+            if not ls_stats.accepted:
+                self.georce_stats.line_search_warnings += 1
 
             # L12/L13: update state without tracking to avoid graph growth
             with torch.no_grad():
@@ -3153,8 +3254,7 @@ class GEORCEFinsler(torch.nn.Module):
                 self.compute_energy(x_t_i, x_0, x_T), x_t_i, materialize_grads=True
             )[0]
             # (T-2, d)
-            norm_grad_E_t = torch.linalg.vector_norm(grad_E_t.reshape(-1))
-            norm_grad_E_t = norm_grad_E_t / (grad_E_t.shape[0] * grad_E_t.shape[1])
+            norm_grad_E_t = self._energy_grad_norm(grad_E_t)
             i += 1
 
             # Logging
@@ -3166,22 +3266,32 @@ class GEORCEFinsler(torch.nn.Module):
             E_list.append(E)
             alpha_list.append(alpha)
 
+            iter_stats = GEORCEIterationStats(
+                iteration=i,
+                grad_norm=norm_grad_E_t.item(),
+                distance=dst,
+                energy=E,
+                alpha=alpha,
+                line_search=ls_stats,
+            )
+            self.georce_stats.iterations.append(iter_stats)
+
             if self.pbar:
                 pbar.set_description(
-                    f"{i=:0>3} |"
-                    f" alpha: {alpha:.3E}, "
-                    f"E = {E:.3E}, "
-                    f"grad_E = {norm_grad_E_t.item():.3E}, "
-                    f" dst = {dst:.3E}"
+                    f"iter={i:0>3} alpha={alpha:.3E} E={E:.3E} grad={norm_grad_E_t.item():.3E} dst={dst:.3E}"
                 )
                 pbar.update(1)
 
         if norm_grad_E_t.isnan():
-            print(
-                "Warning: Gradient of the energy is NaN. Stopping optimization. Return straight line."
-            )
+            self.georce_stats.line_search_warnings += 1
             t = torch.linspace(0, 1, self.T, device=x_0.device, dtype=x_0.dtype)
             x_t_i = x_0[None, :] + t[1:-1, None] * (x_T - x_0)[None, :]  # (T-2, d)
+
+        self.georce_stats.final_distance = dst_list[-1]
+        self.georce_stats.final_energy = E_list[-1]
+        self.georce_stats.final_grad_norm = norm_gE_list[-1]
+        self.georce_stats.n_iter = i
+        self.georce_stats.converged = bool(norm_grad_E_t <= self.tol)
 
         x_final = torch.cat([x_0[None, :], x_t_i, x_T[None, :]], dim=0)  # (T, d)
         dst_list = torch.tensor(dst_list)
