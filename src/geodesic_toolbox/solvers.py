@@ -1922,7 +1922,10 @@ class SolverGraphFinsler(torch.nn.Module):
             closest component.
         """
         # Get connected components from the adjacency matrix A
-        G = DiGraph(A.cpu().numpy())
+        if isinstance(A, torch.Tensor):
+            G = DiGraph(A.cpu().numpy())
+        else:
+            G = DiGraph(A)
         cc_list = []
         for c in nx.strongly_connected_components(G):
             cc_list.append(torch.tensor(list(c)))
@@ -2864,7 +2867,9 @@ class GEORCEFinsler(torch.nn.Module):
         self.pbar = pbar
         self.georce_finsler_stats: GEORCERunStats | None = None
 
-    def compute_distance(self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None) -> torch.Tensor:
+    def compute_distance(
+        self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None
+    ) -> torch.Tensor:
         """Given a trajectory and the tangent vectors, compute the distance
         under the finsler metric.
 
@@ -3036,7 +3041,9 @@ class GEORCEFinsler(torch.nn.Module):
         """Compute normalized gradient norm used for GEORCE stopping criteria."""
         return torch.linalg.vector_norm(grad_E_t.reshape(-1)) / grad_E_t.numel()
 
-    def line_search(self, x_0: Tensor, x_T: Tensor, u_t: Tensor, u_t_i: Tensor, x_t_i: Tensor) -> tuple[float, GEORCELineSearchStats]:
+    def line_search(
+        self, x_0: Tensor, x_T: Tensor, u_t: Tensor, u_t_i: Tensor, x_t_i: Tensor
+    ) -> tuple[float, GEORCELineSearchStats]:
         """
         Perform a Armiijo's line search to find the optimal step size alpha.
 
