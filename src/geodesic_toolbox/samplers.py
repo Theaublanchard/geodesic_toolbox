@@ -1408,7 +1408,7 @@ class EulerIntegrator(torch.nn.Module):
             traj_p = [p_0.clone().detach()]
 
         is_nan: bool = False
-        for k in tqdm(range(L - 1), desc="Euler integration", unit="steps"):
+        for k in tqdm(range(L - 1), desc="Euler integration", unit="steps", leave=False):
             for _ in range(self.substeps):
                 q_1, p_1 = self.euler_step(q_1, p_1)
                 if torch.isnan(q_1).any() or torch.isnan(p_1).any():
@@ -1578,7 +1578,7 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
             traj_q = [q_0.clone().detach()]
             traj_p = [p_0.clone().detach()]
 
-        for k in tqdm(range(L - 1), desc="Leapfrog integration", unit="steps"):
+        for k in tqdm(range(L - 1), desc="Leapfrog integration", unit="steps", leave=False):
             q_1, p_1 = self.leapfrog_step(q_1, p_1)
 
             if return_traj:
@@ -1771,7 +1771,7 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
             traj_p = [p_0.clone().detach()]
 
         is_nan: bool = False
-        for k in tqdm(range(L - 1), desc="Leapfrog steps", unit="steps"):
+        for k in tqdm(range(L - 1), desc="Leapfrog steps", unit="steps", leave=False):
             for _ in range(self.substeps):
                 q_0, p_0, q_1, p_1 = self.leapfrog_step(q_0, p_0, q_1, p_1)
 
