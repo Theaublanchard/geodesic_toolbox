@@ -22,7 +22,7 @@ from .cometric import (
     RandersMetrics,
     DualRandersMetrics,
 )
-from .samplers import ExplicitLeapfrogIntegrator
+from .samplers import ExplicitLeapfrogIntegrator, ImplicitLeapfrogIntegrator, EulerIntegrator
 from .utils import (
     magnification_factor,
     # hamiltonian,
@@ -3525,14 +3525,18 @@ class ExpMapRanders(torch.nn.Module):
     -----------
     randers : RandersMetric
         The base Randers metric to compute the geodesics
-    T: int
-        The number of time points to compute along the trajectory
     T_max : float
         The maximum time to use for the geodesic trajectory.
-    omega : float
-        Coupling parameter for the integrator.
+    T: int
+        The number of time points to compute along the trajectory. Step size of the integrator is computed as T_max / T.
+    solver : str
+        The solver to use for the shooting method. Must be one of 'leapfrog_explicit', 'leapfrog_implicit' or 'euler'. Default is 'leapfrog_implicit'.
     substep : int
         The number of substeps to use for the integrator. Default is 1 (no substeps).
+    omega : float
+        Coupling parameter for the explcit leapfrog integrator. Only used if solver is 'leapfrog_explicit'. Default is 10.0.
+    n_fix_pts : int
+        The number of fixed point iterations to use for the implicit leapfrog integrator. Only used if solver is 'leapfrog_implicit'. Default is 5.
     """
 
     def __init__(
@@ -3540,26 +3544,50 @@ class ExpMapRanders(torch.nn.Module):
         randers: RandersMetrics,
         T_max=1.0,
         T=10,
-        omega: float = 10.0,
+        solver: str = "leapfrog_explicit",
         substeps: int = 1,
+        omega: float = 10.0,
+        n_fix_pts: int = 5,
     ):
         super().__init__()
         self.randers = randers
+
         self.T = T
         self.T_max = T_max
         self.t = torch.linspace(0, T_max, T)
         self.dt = self.t[1] - self.t[0]
-        self.omega = omega
+
         self.substeps = substeps
+        self.solver = solver
+        self.omega = omega
+        self.n_fix_pts = n_fix_pts
 
         self.dual_r = DualRandersMetrics(randers)
 
-        self.shooter = ExplicitLeapfrogIntegrator(
-            H=self.H,
-            gamma=self.dt,
-            omega=self.omega,
-            substeps=self.substeps,
-        )
+        if self.solver == "leapfrog_explicit":
+            self.shooter = ExplicitLeapfrogIntegrator(
+                H=self.H,
+                gamma=self.dt,
+                omega=self.omega,
+                substeps=self.substeps,
+            )
+        elif self.solver == "leapfrog_implicit":
+            self.shooter = ImplicitLeapfrogIntegrator(
+                H=self.H,
+                gamma=self.dt,
+                substeps=self.substeps,
+                n_fix_pts=self.n_fix_pts,
+            )
+        elif self.solver == "euler":
+            self.shooter = EulerIntegrator(
+                H=self.H,
+                gamma=self.dt,
+                substeps=self.substeps,
+            )
+        else:
+            raise ValueError(
+                f"Unknown solver {self.solver=}. Must be one of 'leapfrog_explicit', 'leapfrog_implicit' or 'euler'."
+            )
 
     def legendre_transform(self, q: Tensor, v: Tensor) -> Tensor:
         """
