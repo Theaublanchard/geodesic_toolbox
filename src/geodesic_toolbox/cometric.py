@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
+import weakref
 from sklearn.cluster import KMeans
 import numpy as np
 from tqdm import tqdm
@@ -2126,10 +2127,11 @@ class _DualOmegaWrapper(nn.Module):
 
     def __init__(self, dual_randers_instance):
         super().__init__()
-        self.dual_randers = dual_randers_instance
+        # Keep a non-Module reference to avoid creating a recursive module tree.
+        self._dual_randers = weakref.proxy(dual_randers_instance)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.dual_randers.omega_star(x)
+        return self._dual_randers.omega_star(x)
 
 
 class _DualCometricWrapper(CoMetric):
@@ -2137,17 +2139,18 @@ class _DualCometricWrapper(CoMetric):
 
     def __init__(self, dual_randers_instance):
         super().__init__()
-        self.dual_randers = dual_randers_instance
+        # Keep a non-Module reference to avoid creating a recursive module tree.
+        self._dual_randers = weakref.proxy(dual_randers_instance)
         self.is_diag = False
 
     def forward(self, x: Tensor) -> Tensor:
         """Returns the inverse of the dual metric tensor (the dual cometric)."""
-        G_star = self.dual_randers.G_star(x)
+        G_star = self._dual_randers.G_star(x)
         return torch.linalg.inv(G_star)
 
     def metric_tensor(self, x: Tensor) -> Tensor:
         """Returns the dual metric tensor."""
-        return self.dual_randers.G_star(x)
+        return self._dual_randers.G_star(x)
 
 
 class DualRandersMetrics(RandersMetrics):
