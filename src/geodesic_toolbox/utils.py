@@ -399,19 +399,15 @@ def vec(M: Tensor) -> Tensor:
     return rearrange(M, "b m n -> b (m n)")
 
 
-def sample_pts(cometric, q0, N_pts, std=0.2):
+def sample_cometric_normal(cometric: CoMetric, q0: torch.Tensor) -> torch.Tensor:
     """
     Sample tangent vectors from the normal distribution N(0, G_inv(q0))
 
     Parameters
     ----------
     cometric : CoMetric
-    q0 : torch.Tensor (d,)
+    q0 : torch.Tensor (N_pts, d)
         Point at which to sample
-    N_pts : int
-        Number of points to sample
-    std : float
-        Standard deviation of the normal distribution
 
     Returns
     -------
@@ -419,15 +415,14 @@ def sample_pts(cometric, q0, N_pts, std=0.2):
         Sampled points
     """
     # Sample according to N(0, G_inv)
-    v = std * torch.randn((N_pts, q0.shape[0]), device=q0.device, dtype=q0.dtype)
-    # G_inv = cometric.cometric_tensor(q0.unsqueeze(0)).squeeze(0)
-    G_inv = cometric.metric_tensor(q0.unsqueeze(0)).squeeze(0)
+    z = torch.randn_like(q0)
+    G_inv = cometric.cometric_tensor(q0)
     if cometric.is_diag:
         L = G_inv.sqrt()
-        v = v * L
+        v = z * L
     else:
-        L = torch.linalg.cholesky(G_inv)
-        v = torch.einsum("ij,bj->bi", L, v)
+        L = torch.linalg.cholesky(G_inv)  # (b,d,d)
+        v = torch.einsum("bij,bj->bi", L, z)
     return v
 
 
