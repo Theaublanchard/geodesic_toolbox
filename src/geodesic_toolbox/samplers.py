@@ -1326,6 +1326,276 @@ class Hamiltonian(torch.nn.Module):
         )
 
 
+class EulerIntegrator(torch.nn.Module):
+    """
+    Euler integrator for Riemannian Hamiltonian Monte Carlo.
+
+    Parameters:
+    ----------
+    H : Hamiltonian
+        The Hamiltonian function H(q, p) that takes position q and momentum p and returns the energy.
+    gamma : float
+        The step size for the Euler integrator.
+    """
+
+    def __init__(self, H: Hamiltonian, gamma: float, substeps: int = 1):
+        super().__init__()
+        self.H = H
+        self.gamma = gamma
+        self.substeps = substeps
+
+        # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
+        no_batch_H = lambda q, p: self.H(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
+        self._dH_dq = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
+        self._dH_dp = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
+        self.dH_dq = lambda p, q: self._dH_dq(q, p)
+        self.dH_dp = lambda p, q: self._dH_dp(q, p)
+
+    def euler_step(self, q: Tensor, p: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Perform a single Euler step.
+
+        Parameters
+        ----------
+        q : Tensor (b,d)
+            The initial position.
+        p : Tensor (b,d)
+            The initial momentum.
+
+        Returns
+        -------
+        q_new : Tensor (b,d)
+            The new position.
+        p_new : Tensor (b,d)
+            The new momentum.
+        """
+        dz_dt = self.dH_dp(q, p)
+        dp_dt = -self.dH_dq(q, p)
+        q_new = q + self.gamma * dz_dt
+        p_new = p + self.gamma * dp_dt
+        return q_new, p_new
+
+    def forward(
+        self, q_0: Tensor, p_0: Tensor, L: int, return_traj: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Performs L-1 Euler steps starting from (q_0, p_0).
+
+        Parameters
+        ----------
+        q_0 : Tensor (b,d)
+            The initial position.
+        p_0 : Tensor (b,d)
+            The initial momentum.
+        L : int
+            The number of Euler steps to perform.
+        return_traj : bool
+            If True, it returns the trajectory of the samples over the L Euler steps.
+
+        Returns
+        -------
+        q_L : Tensor (b,d)
+            The new position after L leapfrog steps.
+        p_L : Tensor (b,d)
+            The new momentum after L leapfrog steps.
+        or
+        (Tensor (b,L,d), Tensor (b,L,d))
+            The trajectory of the positions and momenta over the L leapfrog steps.
+        """
+        q_1, p_1 = q_0.clone(), p_0.clone()
+        if return_traj:
+            traj_q = [q_0.clone().detach()]
+            traj_p = [p_0.clone().detach()]
+
+        is_nan: bool = False
+        for k in tqdm(range(L - 1), desc="Euler integration", unit="steps"):
+            for _ in range(self.substeps):
+                q_1, p_1 = self.euler_step(q_1, p_1)
+                if torch.isnan(q_1).any() or torch.isnan(p_1).any():
+                    print(f"NaN detected at step {k} of Euler integration.")
+                    is_nan = True
+                    break
+            if is_nan:
+                ...
+                break
+
+            if return_traj:
+                if k == L - 1:
+                    traj_q.append(q_1.clone())
+                    traj_p.append(p_1.clone())
+                else:
+                    traj_q.append(q_1.clone().detach())
+                    traj_p.append(p_1.clone().detach())
+
+        if return_traj:
+            traj_q = torch.stack(traj_q, dim=1)
+            traj_p = torch.stack(traj_p, dim=1)
+            return traj_q, traj_p
+        return q_1, p_1
+
+
+class ImplicitLeapfrogIntegrator(torch.nn.Module):
+    """
+    Implicit leapfrog integrator for Riemannian Hamiltonian Monte Carlo.
+
+    Parameters:
+    ----------
+    H : Hamiltonian
+        The Hamiltonian function H(q, p) that takes position q and momentum p and returns the energy.
+    gamma : float
+        The step size for the leapfrog integrator.
+    n_fix_pts : int
+        The number of fixed point iterations to perform for the implicit equations.
+    substeps : int
+        The number of substeps for the leapfrog integrator.
+        This is the number of times the leapfrog step is applied to the same pair of states (q_0, p_0)
+        and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
+    """
+
+    def __init__(self, H: Hamiltonian, gamma: float, n_fix_pts: int, substeps: int = 1):
+        super().__init__()
+        self.H = H
+        self.gamma = gamma
+        self.n_fix_pts = n_fix_pts
+        self.substeps = substeps
+
+        # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
+        no_batch_H = lambda q, p: self.H(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
+        self._dH_dq = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
+        self._dH_dp = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
+        self.dH_dq = lambda q, p: self._dH_dq(q, p)
+        self.dH_dp = lambda q, p: self._dH_dp(q, p)
+
+    def get_p_half(self, q_0: Tensor, p_0: Tensor) -> Tensor:
+        """
+        Solves the fixed point equation for the momentum:
+        p_half = p_0 - gamma/2 * dH_dq(q_0, p_half)
+
+        Parameters
+        ----------
+        q_0 : Tensor (b,d)
+            The initial position.
+        p_0 : Tensor (b,d)
+            The initial momentum.
+
+        Returns
+        -------
+        p_half : Tensor (b,d)
+            The half step momentum.
+        """
+        p_half = p_0.clone()
+        for k in range(self.n_fix_pts):
+            p_half_ = p_0 - self.gamma * self.dH_dq(q_0, p_half) / 2
+            # if (p_half_ - p_half).abs().max() < 1e-6:
+            #     p_half = p_half_
+            #     break
+            p_half = p_half_
+        return p_half
+
+    def get_q_new(self, q_0: Tensor, p_half: Tensor) -> Tensor:
+        """
+        Solves the fixed point equation for the position:
+        q_new = q_0 + gamma/2 * ( dH_dp(q_0, p_half) + dH_dp(q_new,p_half) )
+
+        Parameters
+        ----------
+        q_0 : Tensor (b,d)
+            The initial position.
+        p_half : Tensor (b,d)
+            The half step momentum.
+
+        Returns
+        -------
+        q_new : Tensor (b,d)
+            The new position.
+        """
+        q_new = q_0.clone()
+        for k in range(self.n_fix_pts):
+            q_new_ = (
+                q_new + self.gamma * (self.dH_dp(q_0, p_half) + self.dH_dp(q_new, p_half)) / 2
+            )
+            # if (q_new_ - q_new).abs().max() < 1e-6:
+            #     q_new = q_new_
+            #     break
+            q_new = q_new_
+        return q_new
+
+    def leapfrog_step(self, q_0: Tensor, p_0: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Leapfrog step for the Hamiltonian H.
+
+        Parameters
+        ----------
+        q_0 : Tensor (b,d)
+            The initial position.
+        p_0 : Tensor (b,d)
+            The initial momentum.
+
+        Returns
+        -------
+        q_1 : Tensor (b,d)
+            The new position.
+        p_1 : Tensor (b,d)
+            The new momentum.
+        """
+        q_1 = q_0.clone()
+        p_1 = p_0.clone()
+        for _ in range(self.substeps):
+            p_half = self.get_p_half(q_1, p_1)
+            q_1 = self.get_q_new(q_0, p_half)
+            p_1 = p_half - self.gamma * self.dH_dq(q_1, p_half) / 2
+        return q_1, p_1
+
+    def forward(
+        self, q_0: Tensor, p_0: Tensor, L: int, return_traj: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Performs L-1 leapfrog steps starting from (q_0, p_0).
+
+        Parameters
+        ----------
+        q_0 : Tensor (b,d)
+            The initial position.
+        p_0 : Tensor (b,d)
+            The initial momentum.
+        L : int
+            The number of leapfrog steps to perform.
+        return_traj : bool
+            If True, it returns the trajectory of the samples over the L leapfrog steps.
+
+        Returns
+        -------
+        q_L : Tensor (b,d)
+            The new position after L leapfrog steps.
+        p_L : Tensor (b,d)
+            The new momentum after L leapfrog steps.
+        or
+        (Tensor (b,L,d), Tensor (b,L,d))
+            The trajectory of the positions and momenta over the L leapfrog steps.
+        """
+        q_1, p_1 = q_0.clone(), p_0.clone()
+        if return_traj:
+            traj_q = [q_0.clone().detach()]
+            traj_p = [p_0.clone().detach()]
+
+        for k in tqdm(range(L - 1), desc="Leapfrog integration", unit="steps"):
+            q_1, p_1 = self.leapfrog_step(q_1, p_1)
+
+            if return_traj:
+                if k == L - 1:
+                    traj_q.append(q_1.clone())
+                    traj_p.append(p_1.clone())
+                else:
+                    traj_q.append(q_1.clone().detach())
+                    traj_p.append(p_1.clone().detach())
+
+        if return_traj:
+            traj_q = torch.stack(traj_q, dim=1)
+            traj_p = torch.stack(traj_p, dim=1)
+            return traj_q, traj_p
+        return q_1, p_1
+
+
 class ExplicitLeapfrogIntegrator(torch.nn.Module):
     """
     Explicit leapfrog integrator for Riemannian Hamiltonian Monte Carlo.
@@ -1333,15 +1603,15 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
     Parameters:
     ----------
     H : Hamiltonian
-        The Hamiltonian function H(z, v) that takes position q and momentum p and returns the energy.
+        The Hamiltonian function H(q, p) that takes position q and momentum p and returns the energy.
     gamma : float
         The step size for the leapfrog integrator.
     omega : float
         The binding parameter for the leapfrog integrator.
     substeps : int
         The number of substeps for the leapfrog integrator.
-        This is the number of times the leapfrog step is applied to the same pair of states (z_0, v_0)
-        and (z_1, v_1) before updating the states. This can be used to improve the stability of the integrator.
+        This is the number of times the leapfrog step is applied to the same pair of states (q_0, p_0)
+        and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
     """
 
     def __init__(self, H: Hamiltonian, gamma: float, omega: float, substeps: int = 1):
@@ -1360,63 +1630,63 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         self.register_buffer("s", s, persistent=False)
 
         # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
-        no_batch_H = lambda z, v: self.H_base(z.unsqueeze(0), v.unsqueeze(0)).squeeze(0)
-        self._dH_dz = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
-        self._dH_dv = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
-        self.dH_dz = lambda z, v: self._dH_dz(z, v)
-        self.dH_dv = lambda z, v: self._dH_dv(z, v)
+        no_batch_H = lambda q, p: self.H_base(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
+        self._dH_dq = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
+        self._dH_dp = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
+        self.dH_dq = lambda q, p: self._dH_dq(q, p)
+        self.dH_dp = lambda q, p: self._dH_dp(q, p)
 
-    def binding(self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor) -> Tensor:
+    def binding(self, q_0: Tensor, p_0: Tensor, q_1: Tensor, p_1: Tensor) -> Tensor:
         """
         Compute the binding energy between two states.
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
+        q_0 : Tensor (b,d)
             The position of the first state.
-        v_0 : Tensor (b,d)
-            The velocity of the first state.
-        z_1 : Tensor (b,d)
+        p_0 : Tensor (b,d)
+            The momentum of the first state.
+        q_1 : Tensor (b,d)
             The position of the second state.
-        v_1 : Tensor (b,d)
-            The velocity of the second state.
+        p_1 : Tensor (b,d)
+            The momentum of the second state.
 
         Returns
         -------
         Tensor (b,)
             The binding energy.
         """
-        h = torch.linalg.vector_norm(z_1 - z_0, dim=-1) ** 2 / 2
-        h += torch.linalg.vector_norm(v_1 - v_0, dim=-1) ** 2 / 2
+        h = torch.linalg.vector_norm(q_1 - q_0, dim=-1) ** 2 / 2
+        h += torch.linalg.vector_norm(p_1 - p_0, dim=-1) ** 2 / 2
         return h
 
-    def H(self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor) -> Tensor:
+    def H(self, q_0: Tensor, p_0: Tensor, q_1: Tensor, p_1: Tensor) -> Tensor:
         """
-        Compute the augmented Hamiltonian H(z_0, v_0, z_1, v_1) = H(z_0, v_0) + H(z_1, v_1) + omega * binding(z_0, v_0, z_1, v_1)
+        Compute the augmented Hamiltonian H(q_0, p_0, q_1, p_1) = H(q_0, p_0) + H(q_1, p_1) + omega * binding(q_0, p_0, q_1, p_1)
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
+        q_0 : Tensor (b,d)
             The position of the first state.
-        v_0 : Tensor (b,d)
-            The velocity of the first state.
-        z_1 : Tensor (b,d)
+        p_0 : Tensor (b,d)
+            The momentum of the first state.
+        q_1 : Tensor (b,d)
             The position of the second state.
-        v_1 : Tensor (b,d)
-            The velocity of the second state.
+        p_1 : Tensor (b,d)
+            The momentum of the second state.
 
         Returns
         -------
         Tensor (b,)
             The augmented Hamiltonian.
         """
-        H_0 = self.H_base(z_0, v_0)
-        H_1 = self.H_base(z_1, v_1)
-        H = H_0 + H_1 + self.omega * self.binding(z_0, v_0, z_1, v_1)
+        H_0 = self.H_base(q_0, p_0)
+        H_1 = self.H_base(q_1, p_1)
+        H = H_0 + H_1 + self.omega * self.binding(q_0, p_0, q_1, p_1)
         return H
 
     def leapfrog_step(
-        self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor
+        self, q_0: Tensor, p_0: Tensor, q_1: Tensor, p_1: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Leapfrog step for the augmented Hamiltonian.
@@ -1425,61 +1695,61 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
+        q_0 : Tensor (b,d)
             The position of the first state.
-        v_0 : Tensor (b,d)
-            The velocity of the first state.
-        z_1 : Tensor (b,d)
+        p_0 : Tensor (b,d)
+            The momentum of the first state.
+        q_1 : Tensor (b,d)
             The position of the second state.
-        v_1 : Tensor (b,d)
-            The velocity of the second state.
+        p_1 : Tensor (b,d)
+            The momentum of the second state.
 
         Returns
         -------
-        z_0_new : Tensor (b,d)
+        q_0_new : Tensor (b,d)
             The new position of the first state.
-        v_0_new : Tensor (b,d)
-            The new velocity of the first state.
-        z_1_new : Tensor (b,d)
+        p_0_new : Tensor (b,d)
+            The new momentum of the first state.
+        q_1_new : Tensor (b,d)
             The new position of the second state.
-        v_1_new : Tensor (b,d)
-            The new velocity of the second state.
+        p_1_new : Tensor (b,d)
+            The new momentum of the second state.
         """
-        c = self.c.to(z_0.device).to(z_0.dtype)
-        s = self.s.to(z_0.device).to(z_0.dtype)
+        c = self.c.to(q_0.device).to(q_0.dtype)
+        s = self.s.to(q_0.device).to(q_0.dtype)
 
-        v_0_new = v_0 - self.step_size / 2 * self.dH_dz(z_0, v_1)
-        z_1_new = z_1 + self.step_size / 2 * self.dH_dv(z_0, v_1)
-        v_1_new = v_1 - self.step_size / 2 * self.dH_dz(z_1_new, v_0)
-        z_0_new = z_0 + self.step_size / 2 * self.dH_dv(z_1_new, v_0)
+        p_0_new = p_0 - self.step_size / 2 * self.dH_dq(q_0, p_1)
+        q_1_new = q_1 + self.step_size / 2 * self.dH_dp(q_0, p_1)
+        p_1_new = p_1 - self.step_size / 2 * self.dH_dq(q_1_new, p_0)
+        q_0_new = q_0 + self.step_size / 2 * self.dH_dp(q_1_new, p_0)
 
         # Apply the binding map simultaneously from the same pre-rotation state.
-        z0_pre, v0_pre = z_0_new, v_0_new
-        z1_pre, v1_pre = z_1_new, v_1_new
+        q0_pre, p0_pre = q_0_new, p_0_new
+        q1_pre, p1_pre = q_1_new, p_1_new
 
-        z_0_new = (z0_pre + z1_pre + c * (z0_pre - z1_pre) + s * (v0_pre - v1_pre)) / 2
-        v_0_new = (v0_pre + v1_pre - s * (z0_pre - z1_pre) + c * (v0_pre - v1_pre)) / 2
-        z_1_new = (z0_pre + z1_pre - c * (z0_pre - z1_pre) - s * (v0_pre - v1_pre)) / 2
-        v_1_new = (v0_pre + v1_pre + s * (z0_pre - z1_pre) - c * (v0_pre - v1_pre)) / 2
+        q_0_new = (q0_pre + q1_pre + c * (q0_pre - q1_pre) + s * (p0_pre - p1_pre)) / 2
+        p_0_new = (p0_pre + p1_pre - s * (q0_pre - q1_pre) + c * (p0_pre - p1_pre)) / 2
+        q_1_new = (q0_pre + q1_pre - c * (q0_pre - q1_pre) - s * (p0_pre - p1_pre)) / 2
+        p_1_new = (p0_pre + p1_pre + s * (q0_pre - q1_pre) - c * (p0_pre - p1_pre)) / 2
 
-        v_1_new = v_1_new - self.step_size / 2 * self.dH_dz(z_1_new, v_0_new)
-        z_0_new = z_0_new + self.step_size / 2 * self.dH_dv(z_1_new, v_0_new)
-        v_0_new = v_0_new - self.step_size / 2 * self.dH_dz(z_0_new, v_1_new)
-        z_1_new = z_1_new + self.step_size / 2 * self.dH_dv(z_0_new, v_1_new)
+        p_1_new = p_1_new - self.step_size / 2 * self.dH_dq(q_1_new, p_0_new)
+        q_0_new = q_0_new + self.step_size / 2 * self.dH_dp(q_1_new, p_0_new)
+        p_0_new = p_0_new - self.step_size / 2 * self.dH_dq(q_0_new, p_1_new)
+        q_1_new = q_1_new + self.step_size / 2 * self.dH_dp(q_0_new, p_1_new)
 
-        return z_0_new, v_0_new, z_1_new, v_1_new
+        return q_0_new, p_0_new, q_1_new, p_1_new
 
     @torch.no_grad()
-    def forward(self, z_0: Tensor, v_0: Tensor, L: int, return_traj: bool = False):
+    def forward(self, q_0: Tensor, p_0: Tensor, L: int, return_traj: bool = False):
         """
         Perform L-1 leapfrog steps with the augmented Hamiltonian.
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
+        q_0 : Tensor (b,d)
             The initial position.
-        v_0 : Tensor (b,d)            
-            The initial velocity.
+        p_0 : Tensor (b,d)
+            The initial momentum.
         L : int
             The number of leapfrog steps to perform.
         return_traj : bool
@@ -1487,37 +1757,53 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
 
         Returns
         -------
-        z_L : Tensor (b,d)
+        q_L : Tensor (b,d)
             The new position after L leapfrog steps.
-        v_L : Tensor (b,d)
-            The new velocity after L leapfrog steps.
+        p_L : Tensor (b,d)
+            The new momentum after L leapfrog steps.
         or
         (Tensor (b,L,d), Tensor (b,L,d))
-            The trajectory of the positions and velocities over the L leapfrog steps.
+            The trajectory of the positions and momenta over the L leapfrog steps.
         """
-        z_1, v_1 = z_0.clone(), v_0.clone()
+        q_1, p_1 = q_0.clone(), p_0.clone()
         if return_traj:
-            traj_z = [z_0.clone().detach()]
-            traj_v = [v_0.clone().detach()]
+            traj_q = [q_0.clone().detach()]
+            traj_p = [p_0.clone().detach()]
 
-        for k in tqdm(range(L-1), desc="Leapfrog steps", unit="steps"):
+        is_nan: bool = False
+        for k in tqdm(range(L - 1), desc="Leapfrog steps", unit="steps"):
             for _ in range(self.substeps):
-                z_0, v_0, z_1, v_1 = self.leapfrog_step(z_0, v_0, z_1, v_1)
+                q_0, p_0, q_1, p_1 = self.leapfrog_step(q_0, p_0, q_1, p_1)
+
+                if (
+                    q_0.isnan().any()
+                    or p_0.isnan().any()
+                    or q_1.isnan().any()
+                    or p_1.isnan().any()
+                ):
+                    # raise ValueError("NaN values encountered in leapfrog step.")
+                    print("NaN values encountered in leapfrog step.")
+                    is_nan = True
+                    break
+
+            if is_nan:
+                ...
+                break
 
             if return_traj:
                 # Keep graph only on the final point.
                 if k == L - 1:
-                    traj_z.append(z_0.clone())
-                    traj_v.append(v_0.clone())
+                    traj_q.append(q_0.clone())
+                    traj_p.append(p_0.clone())
                 else:
-                    traj_z.append(z_0.clone().detach())
-                    traj_v.append(v_0.clone().detach())
+                    traj_q.append(q_0.clone().detach())
+                    traj_p.append(p_0.clone().detach())
 
         if return_traj:
-            traj_z = torch.stack(traj_z, dim=1)
-            traj_v = torch.stack(traj_v, dim=1)
-            return traj_z, traj_v
-        return z_0, v_0
+            traj_q = torch.stack(traj_q, dim=1)
+            traj_p = torch.stack(traj_p, dim=1)
+            return traj_q, traj_p
+        return q_0, p_0
 
 
 class ExplicitRHMCSampler(Sampler):
