@@ -1512,7 +1512,7 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
         q_new = q_0.clone()
         for k in range(self.n_fix_pts):
             q_new_ = (
-                q_new + self.gamma * (self.dH_dp(q_0, p_half) + self.dH_dp(q_new, p_half)) / 2
+                q_0 + self.gamma * (self.dH_dp(q_0, p_half) + self.dH_dp(q_new, p_half)) / 2
             )
             # if (q_new_ - q_new).abs().max() < 1e-6:
             #     q_new = q_new_
@@ -1542,7 +1542,7 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
         p_1 = p_0.clone()
         for _ in range(self.substeps):
             p_half = self.get_p_half(q_1, p_1)
-            q_1 = self.get_q_new(q_0, p_half)
+            q_1 = self.get_q_new(q_1, p_half)
             p_1 = p_half - self.gamma * self.dH_dq(q_1, p_half) / 2
         return q_1, p_1
 
