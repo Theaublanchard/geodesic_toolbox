@@ -3592,6 +3592,9 @@ class ExpMapRanders(torch.nn.Module):
     def legendre_transform(self, q: Tensor, v: Tensor) -> Tensor:
         """
         Convert a speed vector to a momentum vector using the Legendre transform.
+        Formula given by Lemma 1.1 (iii) of 10.48550/arXiv.0808.1166 Heat flow on Finsler manifolds
+
+        p = g(x,v) v
 
         Parameters
         ----------
@@ -3605,16 +3608,32 @@ class ExpMapRanders(torch.nn.Module):
         p : torch.Tensor (b, d)
             Momentum
         """
-        f = self.randers(q, v)[:, None]
-        alpha = self.randers.base_cometric.metric(q, v).sqrt()[:, None]
-        omega = self.randers.omega(q) * self.randers.beta
-        G = self.randers.base_cometric.metric_tensor(q)
-        if self.randers.base_cometric.is_diag:  # (b, d)
-            Gv = G * v
-        else:  # (b, d, d)
-            Gv = torch.einsum("bij,bj->bi", G, v)
-        p = f * (Gv / alpha + omega)
+        g = self.randers.fundamental_tensor(q, v)
+        p = torch.einsum("bij,bj->bi", g, v)
         return p
+
+    def inverse_legendre_transform(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Convert a momentum vector to a speed vector using the inverse Legendre transform.
+        Formula given by Lemma 1.1 (iii) of 10.48550/arXiv.0808.1166 Heat flow on Finsler manifolds
+
+        v =g^*(x,p) p
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        p : torch.Tensor (b, d)
+            Momentum
+
+        Returns
+        -------
+        v : torch.Tensor (b, d)
+            Speed
+        """
+        g_inv = self.dual_r.fundamental_tensor(q, p)
+        v = torch.einsum("bij,bj->bi", g_inv, p)
+        return v
 
     def H(self, q: Tensor, p: Tensor) -> Tensor:
         """
