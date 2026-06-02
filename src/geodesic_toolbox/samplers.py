@@ -1341,8 +1341,8 @@ class EulerIntegrator(torch.nn.Module):
     def __init__(self, H: Hamiltonian, gamma: float, substeps: int = 1):
         super().__init__()
         self.H = H
-        self.gamma = gamma
         self.substeps = substeps
+        self.gamma = gamma / self.substeps
 
         # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
         no_batch_H = lambda q, p: self.H(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
@@ -1455,9 +1455,9 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
     def __init__(self, H: Hamiltonian, gamma: float, n_fix_pts: int, substeps: int = 1):
         super().__init__()
         self.H = H
-        self.gamma = gamma
         self.n_fix_pts = n_fix_pts
         self.substeps = substeps
+        self.gamma = gamma / self.substeps
 
         # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
         no_batch_H = lambda q, p: self.H(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
@@ -1618,14 +1618,11 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         super().__init__()
         self.H_base = H
         self.substeps = substeps
-        self.gamma = gamma
-        self.step_size = gamma / substeps
+        self.gamma = gamma / self.substeps
         self.omega = omega
 
-        # c = torch.Tensor([2 * self.omega * self.gamma]).cos()
-        # s = torch.Tensor([2 * self.omega * self.gamma]).sin()
-        c = torch.Tensor([2 * self.omega * self.step_size]).cos()
-        s = torch.Tensor([2 * self.omega * self.step_size]).sin()
+        c = torch.Tensor([2 * self.omega * self.gamma]).cos()
+        s = torch.Tensor([2 * self.omega * self.gamma]).sin()
         self.register_buffer("c", c, persistent=False)
         self.register_buffer("s", s, persistent=False)
 
@@ -1718,10 +1715,10 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         c = self.c.to(q_0.device).to(q_0.dtype)
         s = self.s.to(q_0.device).to(q_0.dtype)
 
-        p_0_new = p_0 - self.step_size / 2 * self.dH_dq(q_0, p_1)
-        q_1_new = q_1 + self.step_size / 2 * self.dH_dp(q_0, p_1)
-        p_1_new = p_1 - self.step_size / 2 * self.dH_dq(q_1_new, p_0)
-        q_0_new = q_0 + self.step_size / 2 * self.dH_dp(q_1_new, p_0)
+        p_0_new = p_0 - self.gamma / 2 * self.dH_dq(q_0, p_1)
+        q_1_new = q_1 + self.gamma / 2 * self.dH_dp(q_0, p_1)
+        p_1_new = p_1 - self.gamma / 2 * self.dH_dq(q_1_new, p_0)
+        q_0_new = q_0 + self.gamma / 2 * self.dH_dp(q_1_new, p_0)
 
         # Apply the binding map simultaneously from the same pre-rotation state.
         q0_pre, p0_pre = q_0_new, p_0_new
@@ -1732,10 +1729,10 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         q_1_new = (q0_pre + q1_pre - c * (q0_pre - q1_pre) - s * (p0_pre - p1_pre)) / 2
         p_1_new = (p0_pre + p1_pre + s * (q0_pre - q1_pre) - c * (p0_pre - p1_pre)) / 2
 
-        p_1_new = p_1_new - self.step_size / 2 * self.dH_dq(q_1_new, p_0_new)
-        q_0_new = q_0_new + self.step_size / 2 * self.dH_dp(q_1_new, p_0_new)
-        p_0_new = p_0_new - self.step_size / 2 * self.dH_dq(q_0_new, p_1_new)
-        q_1_new = q_1_new + self.step_size / 2 * self.dH_dp(q_0_new, p_1_new)
+        p_1_new = p_1_new - self.gamma / 2 * self.dH_dq(q_1_new, p_0_new)
+        q_0_new = q_0_new + self.gamma / 2 * self.dH_dp(q_1_new, p_0_new)
+        p_0_new = p_0_new - self.gamma / 2 * self.dH_dq(q_0_new, p_1_new)
+        q_1_new = q_1_new + self.gamma / 2 * self.dH_dp(q_0_new, p_1_new)
 
         return q_0_new, p_0_new, q_1_new, p_1_new
 
