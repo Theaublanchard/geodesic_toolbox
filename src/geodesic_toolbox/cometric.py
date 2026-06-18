@@ -1966,7 +1966,7 @@ class RandersMetrics(FinslerMetric):
         1-form to use for the Randers metric. It should be a function that takes
         in points on the manifold and outputs a vector of the same size as the points.
     beta : float
-        Scaling factor for the 1-form. Default is 1.0. Must be within the range [0,1]. W
+        Scaling factor for the 1-form. Default is 1.0. Must be within the range [0,1].
         When beta=0, the Randers metric reduces to the base cometric.
     """
 
@@ -1982,12 +1982,30 @@ class RandersMetrics(FinslerMetric):
         assert 0 <= beta <= 1, "Beta must be in the range [0, 1]"
         self.beta = beta
 
-    def forward(self, x: Tensor, v: Tensor) -> Tensor:
-        x_norm = self.base_cometric.metric(x, v).sqrt()
-        omega_x = self.omega(x)
-        omega_x_v = torch.einsum("bi,bi->b", omega_x, v)
+    def beta_form(self, x: Tensor, v: Tensor) -> Tensor:
+        """
+        Computes the beta form of the Randers metric.
 
-        F = x_norm + self.beta * omega_x_v
+        Parameters:
+        ----------
+        x : Tensor (b,d)
+            Points in the manifold
+        v : Tensor (b,d)
+            Tangent vectors at x
+
+        Returns:
+        -------
+        beta : Tensor (b,)
+            Beta form of the Randers metric at x in the direction of v
+        """
+        omega_x = self.omega(x)
+        beta = torch.einsum("bi,bi->b", omega_x, v)
+        return self.beta * beta
+
+    def forward(self, x: Tensor, v: Tensor) -> Tensor:
+        alpha = self.base_cometric.metric(x, v).sqrt()
+        beta = self.beta_form(x, v)
+        F = alpha + beta
         return F
 
     def fund_tensor_analytic_(self, z: Tensor, v: Tensor) -> Tensor:
