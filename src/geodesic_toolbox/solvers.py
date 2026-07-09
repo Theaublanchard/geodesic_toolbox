@@ -2568,6 +2568,24 @@ class GEORCE(GeodesicDistanceSolver):
         distance = self.cometric.metric(full_traj[:-1], dx).sqrt()  # (T-1,)
         return distance.sum()
 
+    def main_stop_cond(self,norm_grad_E_t: Tensor, i: int) -> bool:
+        """
+        Check the stopping condition for the GEORCE algorithm.
+
+        Parameters:
+        ----------
+        norm_grad_E_t: Tensor
+            The norm of the gradient of the energy at iteration t.
+        i: int
+            The current iteration number.
+
+        Returns:
+        -------
+        stop: bool
+            True if the stopping condition is met, False otherwise.
+        """
+        return (norm_grad_E_t <= self.tol) | (i >= self.max_iter)
+
     def georce_solver(
         self,
         x_0: Tensor,
@@ -2654,7 +2672,7 @@ class GEORCE(GeodesicDistanceSolver):
         if self.pbar:
             pbar = tqdm(range(self.max_iter), total=self.max_iter, desc="GEORCE")
         # for i in pbar:
-        while (norm_grad_E_t > self.tol) & (i < self.max_iter):
+        while not self.main_stop_cond(norm_grad_E_t, i):
             # L5
             G_inv_t = self.cometric.cometric_tensor(x_t_i)
             G_inv_t = torch.cat(
@@ -3129,6 +3147,39 @@ class GEORCEFinsler(torch.nn.Module):
         distance = self.finsler(full_traj[:-1], dx).abs()  # (T-1,)
         return distance.sum()
 
+    def main_stop_cond(self,norm_grad_E_t: Tensor, i: int) -> bool:
+        """
+        Check the stopping condition for the GEORCE algorithm.
+
+        Parameters:
+        ----------
+        norm_grad_E_t: Tensor
+            The norm of the gradient of the energy at iteration t.
+        i: int
+            The current iteration number.
+
+        Returns:
+        -------
+        stop: bool
+            True if the stopping condition is met, False otherwise.
+        """
+        stats = self.georce_stats
+        if stats is None:
+            return (norm_grad_E_t <= self.tol) | (i >= self.max_iter)
+
+        # # Else we also check if the gradient norm is not decreasing for a long time
+        # # Combine this with stationnary energy to avoid stopping too early when the optimization is stuck in a plateau
+        # if len(stats.iterations) > 10:
+        #     recent_iters = stats.iterations[-10:]
+        #     grad_norms = torch.tensor([iter.grad_norm for iter in recent_iters])
+        #     energies = torch.tensor([iter.energy for iter in recent_iters])
+        #     grad_norm_decreasing = (grad_norms[0] - grad_norms[-1]) / (grad_norms[0] + 1e-8) > 1e-3
+        #     energy_stationary = (energies.max() - energies.min()) / (energies.max() + 1e-8) < 1e-3
+        #     if not grad_norm_decreasing and energy_stationary:
+        #         return True
+        return (norm_grad_E_t <= self.tol) | (i >= self.max_iter)
+
+
     def georce_solver(
         self,
         x_0: Tensor,
@@ -3225,7 +3276,7 @@ class GEORCEFinsler(torch.nn.Module):
             pbar = tqdm(range(self.max_iter), total=self.max_iter, desc="GEORCE")
 
         # while (norm_grad_E_t > self.tol) and (i < self.max_iter) and (norm_grad_E_t / (norm_grad_E_before + 1e-8) > 1e-3):
-        while (norm_grad_E_t > self.tol) & (i < self.max_iter):
+        while not self.main_stop_cond(norm_grad_E_t, i):
             norm_grad_E_before = norm_grad_E_t.clone()
 
             # L5
@@ -3384,7 +3435,7 @@ class SolverGraphGEORCE(GeodesicDistanceSolver):
         n_neighbors: int,
         batch_size: int = 64,
         T: int = 100,
-        max_iter=100,
+        max_iter=20, # low value bc good initialization from graph
         tol=1e-10,
         rho=0.5,
         c=0.9,
@@ -3457,7 +3508,7 @@ class SolverGraphGEORCEFinsler(GEORCEFinsler):
         n_neighbors: int,
         batch_size: int = 64,
         T: int = 100,
-        max_iter=100,
+        max_iter=20, # low value bc good initialization from graph
         tol=1e-10,
         rho=0.5,
         c=0.9,
