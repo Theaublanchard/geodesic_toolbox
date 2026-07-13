@@ -549,7 +549,7 @@ def _random_VMF(mu, kappa, size=None):
     """
     Von Mises - Fisher distribution sampler with
     mean direction mu and concentration kappa.
-    Source : https://hal.science/hal-040004568
+    Source : https://hal.science/hal-04004568/
 
     Parameters
     ----------
