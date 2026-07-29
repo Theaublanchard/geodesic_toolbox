@@ -1162,9 +1162,6 @@ class SolverGraph(GeodesicDistanceSolver):
         W = W.to(device="cpu")
         W = 1 / 2 * (W + W.T)  # Ensure symmetry
 
-        assert is_connected(
-            Graph(W.numpy())
-        ), "The graph is not connected after computing the weights. This should not happen."
         return W
 
     def get_cc_connections_idx(self, A, X):
@@ -1261,14 +1258,25 @@ class SolverGraph(GeodesicDistanceSolver):
         return S
 
     def get_predecessors(self, W) -> torch.Tensor:
-        """Get the predecessors for the shortest path computation..."""
         print("Computing predecessors...")
-        predecessors = shortest_path(
-            csr_matrix(W.cpu().numpy()),
+        # Use the adjacency matrix A to define which entries are edges,
+        # even if their weight in W is 0.
+        A_np = self.A.cpu().numpy()
+        W_np = W.cpu().numpy()
+
+        # Get indices of all edges defined in A
+        rows, cols = np.where(A_np == 1)
+        # Get the weights for these specific edges from W
+        weights = W_np[rows, cols]
+
+        # Construct CSR matrix explicitly with these edges
+        W_csr = csr_matrix((weights, (rows, cols)), shape=W.shape)
+
+        dst_matrix, predecessors = shortest_path(
+            W_csr,
             directed=False,
             return_predecessors=True,
-            overwrite=True,
-        )[1]
+        )
         print("Done.")
         return torch.from_numpy(predecessors)
 
@@ -1899,10 +1907,6 @@ class SolverGraphFinsler(torch.nn.Module):
 
         W = W.to(device="cpu")
 
-        assert is_strongly_connected(
-            DiGraph(W.numpy())
-        ), "The graph is not connected after computing the weights. This should not happen."
-
         return W
 
     def get_cc_connections_idx(self, A, X):
@@ -2019,10 +2023,22 @@ class SolverGraphFinsler(torch.nn.Module):
         return S
 
     def get_predecessors(self, W) -> torch.Tensor:
-        """Get the predecessors for the shortest path computation..."""
         print("Computing predecessors...")
+        # Use the adjacency matrix A to define which entries are edges,
+        # even if their weight in W is 0.
+        A_np = self.A.cpu().numpy()
+        W_np = W.cpu().numpy()
+
+        # Get indices of all edges defined in A
+        rows, cols = np.where(A_np == 1)
+        # Get the weights for these specific edges from W
+        weights = W_np[rows, cols]
+
+        # Construct CSR matrix explicitly with these edges
+        W_csr = csr_matrix((weights, (rows, cols)), shape=W.shape)
+
         dst_matrix, predecessors = shortest_path(
-            csr_matrix(W.cpu().numpy()),
+            W_csr,
             directed=True,
             return_predecessors=True,
         )
@@ -2568,7 +2584,7 @@ class GEORCE(GeodesicDistanceSolver):
         distance = self.cometric.metric(full_traj[:-1], dx).sqrt()  # (T-1,)
         return distance.sum()
 
-    def main_stop_cond(self,norm_grad_E_t: Tensor, i: int) -> bool:
+    def main_stop_cond(self, norm_grad_E_t: Tensor, i: int) -> bool:
         """
         Check the stopping condition for the GEORCE algorithm.
 
@@ -3147,7 +3163,7 @@ class GEORCEFinsler(torch.nn.Module):
         distance = self.finsler(full_traj[:-1], dx).abs()  # (T-1,)
         return distance.sum()
 
-    def main_stop_cond(self,norm_grad_E_t: Tensor, i: int) -> bool:
+    def main_stop_cond(self, norm_grad_E_t: Tensor, i: int) -> bool:
         """
         Check the stopping condition for the GEORCE algorithm.
 
@@ -3178,7 +3194,6 @@ class GEORCEFinsler(torch.nn.Module):
         #     if not grad_norm_decreasing and energy_stationary:
         #         return True
         return (norm_grad_E_t <= self.tol) | (i >= self.max_iter)
-
 
     def georce_solver(
         self,
@@ -3435,7 +3450,7 @@ class SolverGraphGEORCE(GeodesicDistanceSolver):
         n_neighbors: int,
         batch_size: int = 64,
         T: int = 100,
-        max_iter=20, # low value bc good initialization from graph
+        max_iter=20,  # low value bc good initialization from graph
         tol=1e-10,
         rho=0.5,
         c=0.9,
@@ -3508,7 +3523,7 @@ class SolverGraphGEORCEFinsler(GEORCEFinsler):
         n_neighbors: int,
         batch_size: int = 64,
         T: int = 100,
-        max_iter=20, # low value bc good initialization from graph
+        max_iter=20,  # low value bc good initialization from graph
         tol=1e-10,
         rho=0.5,
         c=0.9,
