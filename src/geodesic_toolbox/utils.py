@@ -283,7 +283,7 @@ def get_mf_image(
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> torch.Tensor:
     """
-    Compute the magnification factor on the latent space so as to visualize the distortion of the space.
+    Compute the log magnification factor on the latent space so as to visualize the distortion of the space.
 
     Parameters:
     ----------
@@ -304,8 +304,8 @@ def get_mf_image(
 
     Returns:
     -------
-    mf_image : torch.Tensor (resolution, resolution)
-        The magnification factor image.
+    log_mf_image : torch.Tensor (resolution, resolution)
+        The log magnification factor image.
     """
     if bounds is None and embeddings is None:
         raise ValueError("Either bounds or embeddings must be provided.")
@@ -323,8 +323,8 @@ def get_mf_image(
     Q = torch.stack([xx, yy], dim=-1)
     W, H, _ = Q.shape
     Q = rearrange(Q, "w h c -> (w h) c")
-    mf_image = torch.zeros(W * H, device=device)
-    fn = magnification_factor_metric if use_mf_metric else magnification_factor
+    log_mf_image = torch.zeros(W * H, device=device)
+    fn = cometric.logdet if use_mf_metric else cometric.inv_logdet
     if not verbose:
         pbar = range(0, W * H, max_b_size)
     else:
@@ -337,9 +337,9 @@ def get_mf_image(
     with torch.no_grad():
         # batch computation to avoid memory issues
         for i in pbar:
-            mf_image[i : i + max_b_size] = fn(cometric, Q[i : i + max_b_size].to(device))
-    mf_image = rearrange(mf_image, "(w h) -> w h", w=W, h=H).T
-    return mf_image.cpu()
+            log_mf_image[i : i + max_b_size] = fn(Q[i : i + max_b_size].to(device))
+    log_mf_image = rearrange(log_mf_image, "(w h) -> w h", w=W, h=H).T
+    return log_mf_image.cpu()
 
 
 def batched_kro(a: Tensor, b: Tensor) -> Tensor:
