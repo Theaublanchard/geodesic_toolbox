@@ -2,11 +2,11 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 import weakref
-from sklearn.cluster import KMeans
 import numpy as np
 from tqdm import tqdm
 import kmedoids
-from einops import rearrange, repeat
+from einops import rearrange
+from typing import Self
 
 ################################################################
 # Utils
@@ -345,19 +345,19 @@ class CoMetric(torch.nn.Module):
         angle = torch.acos(cos_angle)
         return angle
 
-    def __add__(self, other: object) -> object:
+    def __add__(self, other: Self) -> Self:
         if isinstance(other, CoMetric):
             return SumOfCometric(self, other)
         else:
             raise ValueError(f"Cannot add {type(other)} to CoMetric")
 
-    def __mul__(self, other: object) -> object:
+    def __mul__(self, other: object) -> Self:
         if isinstance(other, (int, float)):
             return ScaledCometric(self, other)
         else:
             raise ValueError(f"Cannot multiply {type(other)} to CoMetric")
 
-    def __rmul__(self, other: object) -> object:
+    def __rmul__(self, other: object) -> Self:
         return self.__mul__(other)
 
     def eye(self, x):
@@ -389,6 +389,9 @@ class SumOfCometric(CoMetric):
     """
     Sum of two cometrics.
 
+    WARNING : the sum is done at the metric tensor level.
+        NOT on the cometric tensor level. This is because the sum of two cometrics is not a cometric in general.
+
     Parameters:
     -----------
     cometric1: CoMetric
@@ -409,9 +412,9 @@ class SumOfCometric(CoMetric):
         else:
             self.is_diag = False
 
-    def forward(self, q: Tensor) -> Tensor:
-        G_1 = self.cometric1.cometric_tensor(q)
-        G_2 = self.cometric2.cometric_tensor(q)
+    def metric_tensor(self, q: Tensor) -> Tensor:
+        G_1 = self.cometric1.metric_tensor(q)
+        G_2 = self.cometric2.metric_tensor(q)
         if not self.cometric1.is_diag and self.cometric2.is_diag:
             G_2 = torch.diag_embed(G_2)
             return G_1 + G_2
@@ -419,6 +422,14 @@ class SumOfCometric(CoMetric):
             G_1 = torch.diag_embed(G_1)
             return G_1 + G_2
         return G_1 + G_2
+
+    def forward(self, q: Tensor) -> Tensor:
+        if self.is_diag:
+            G = self.metric_tensor(q)
+            return 1 / G
+        else:
+            G = self.metric_tensor(q)
+            return torch.linalg.inv(G)
 
 
 class ScaledCometric(CoMetric):
@@ -1400,11 +1411,18 @@ class LANDRBFCometric(CoMetric):
         tau_squared = self.compute_bandwidths(data, kappa)
         self.register_buffer("tau_squared", tau_squared)
 
-        # w_k parameter
-        self.register_buffer("w_", torch.ones(self.K) / self.K)
-        self.w_ = nn.Parameter(self.w_, requires_grad=learn_weights)
+        # # w_k parameter
+        # self.register_buffer("w_", torch.ones(self.K) / self.K)
+        # self.w_ = nn.Parameter(self.w_, requires_grad=learn_weights)
+        # if learn_weights:
+        #     self.learn_w(data)
+
+        # We do it this way so that w is then fixed.
         if learn_weights:
-            self.learn_w(data)
+            w_ = self.learn_w(data)
+        else:
+            w_ = torch.ones(self.K, device=data.device, dtype=data.dtype) / self.K
+        self.register_buffer("w_", w_)
 
     @property
     def w(self) -> Tensor:
@@ -1553,26 +1571,30 @@ class LANDRBFCometric(CoMetric):
         """
         Learn the weights w_k of the RBF kernels by minimizing the mean squared error between the cometric at the centroids and the cometric given by the RBF interpolation at the centroids.
         """
-        optimizer = torch.optim.Adam([self.w_], lr=1e-2)
+        w_ = nn.Parameter(torch.ones(self.K, device=data.device, dtype=data.dtype) / self.K)
+        optimizer = torch.optim.Adam([w_], lr=1e-2)
         loss_list = []
         pbar = tqdm(range(n_iters), desc="Learning RBF weights", leave=False)
         for _ in pbar:
             optimizer.zero_grad()
-            h_x = self.h(data)  # (N,)
+            h_x = self.h(data, torch.nn.functional.softplus(w_))
             loss = (1 - h_x).pow(2).mean()
             loss.backward()
             optimizer.step()
             loss_list.append(loss.item())
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         self.loss_list = torch.tensor(loss_list)
+        return w_.detach().data
 
-    def h(self, x: Tensor) -> Tensor:
+    def h(self, x: Tensor,w: Tensor) -> Tensor:
         """
         Computes the h(x) function of the RBF cometric.
 
         Parameters:
         x : Tensor (B,d)
             The input points
+        w : Tensor (K,)
+            The positive weights of the RBF kernels
 
         Returns:
         Tensor (B,)
@@ -1587,11 +1609,11 @@ class LANDRBFCometric(CoMetric):
         # Set the RBF values to 1 where the tau_squared is infinite
         rbf = torch.where(torch.isinf(self.tau_squared[None, :]), torch.ones_like(rbf), rbf)
         # Keep mixture weights positive and normalized.
-        h_x = torch.einsum("k,bk->b", self.w, rbf)  # (B,)
+        h_x = torch.einsum("k,bk->b", w, rbf)  # (B,)
         return h_x
 
     def cometric_tensor(self, x: Tensor) -> Tensor:
-        h_x = self.h(x)[:, None]  # (B,1)
+        h_x = self.h(x, self.w)[:, None]  # (B,1)
         G_inv = h_x.expand(-1, x.shape[1]) + self.reg_coef * self.eye(x)  # (B,d)
         return G_inv
 
