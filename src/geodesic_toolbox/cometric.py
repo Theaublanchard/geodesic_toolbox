@@ -1242,7 +1242,8 @@ class LANDCometric(CoMetric):
     reg_coef : float
         The regularization coefficient. Default to 1e-5.
     K: int, Default None
-        If not None, the number of centroids to use, computed by KMedoids clustering
+        If not None, the number of centroids to use, computed by KMedoids clustering.
+        If None, uses all centroids.
     """
 
     def __init__(
@@ -1280,6 +1281,7 @@ class LANDCometric(CoMetric):
 
         self.K = self.centroids.shape[0]
         self.d = self.centroids.shape[1]
+        self.sigma = self.set_sigma()
 
     def process_centroids(self, K: int) -> None:
         """
@@ -1289,17 +1291,12 @@ class LANDCometric(CoMetric):
         K : int
             The number of centroids to select. If K=-1, use all centroids.
         """
-        if K == -1:
-            self.sigma = self.set_sigma()
-            return
-
         dst_mat = torch.cdist(self.centroids, self.centroids, p=2).sqrt().cpu().numpy()
         kmedoids_model = kmedoids.KMedoids(
             n_clusters=K, metric="precomputed", random_state=1312
         )
         kmedoids_model.fit(dst_mat)
         self.centroids = self.centroids[kmedoids_model.medoid_indices_]
-        self.sigma = self.set_sigma()
 
     def set_sigma(self) -> float:
         """
@@ -1344,21 +1341,22 @@ class LANDCometric(CoMetric):
         return f"K={self.K}, alpha={self.alpha.item()}, sigma={self.sigma.item()}, reg_coef={self.reg_coef.item()}"
 
 
-class RBFCometric(CoMetric):
+class LANDRBFCometric(CoMetric):
     """
-    Cometric based on the RBF kernel.
+    Generalisation of the LAND cometric using RBF kernels instead of a single Gaussian kernel.
     The cometric is given by:
     G_inv(x) = diag(h(x)) + reg_coef * Id
-    where h(x) = sum_k w_k exp(- lambda_k /2 * ||x - c_k||^alpha)
-    where c_k are the centroids, and lambda_k are the bandwidths of the RBF kernels.
+    where h(x) = sum_k w_k exp(- ||x - c_k||^2 / (2 * tau_k^2))
+    where c_k are the centroids, and tau_k are the bandwidths of the RBF kernels.
     The weights w_k can be learned or fixed to 1/K.
 
     Parameters:
     -----------
-    centroids : Tensor (K,d)
+    centroids : Tensor (N,d)
         The centroids of the clusters
-    K: int
-        The number of centroids to use. Computed using KMeans.
+    K: int, Default None
+        If not None, the number of centroids to use, computed by KMedoids clustering.
+        If None, uses all centroids.
     kappa : float. Default to 1.0.
         The scaling factor for the bandwidths of the RBF kernels.
     reg_coef : float. Default to 1e-3.
@@ -1379,47 +1377,64 @@ class RBFCometric(CoMetric):
 
         assert data.ndim == 2, f"data should be of shape (N,d), got {data.shape}"
         assert reg_coef >= 0, f"Reg_coef should be a non-negative float, got {reg_coef}"
-        assert (
-            K > 0 and K <= data.shape[0]
-        ), f"K should be in the range (0, {data.shape[0]=}], got {K}"
         assert kappa > 0, f"kappa should be a positive float, got {kappa}"
 
         self.register_buffer("reg_coef", Tensor([reg_coef]))
         self.register_buffer("kappa", Tensor([kappa]))
 
-        centroids_, new_K = self.process_centroids(data, K)
-        self.register_buffer("centroids", centroids_)
-        self.K = new_K
+        self.register_buffer("centroids", data)
+        self.register_buffer(
+            "tau", torch.ones(data.shape[0], device=data.device, dtype=data.dtype)
+        )
 
-        bandwidths = self.compute_bandwidths(data, centroids_, kappa)
-        self.register_buffer("bandwidths", bandwidths)
+        if K is not None:
+            if K > data.shape[0]:
+                print(
+                    f"Warning: K={K} is greater than the number of data points {data.shape[0]}. Using all data points."
+                )
+                K = data.shape[0]
+            self.process_centroids(K)
+
+        self.K = self.centroids.shape[0]
+
+        tau_squared = self.compute_bandwidths(data, kappa)
+        self.register_buffer("tau_squared", tau_squared)
 
         # w_k parameter
-        self.register_buffer("w", torch.ones(self.K) / self.K)
-        self.w = nn.Parameter(self.w, requires_grad=learn_weights)
+        self.register_buffer("w_", torch.ones(self.K) / self.K)
+        self.w_ = nn.Parameter(self.w_, requires_grad=learn_weights)
         if learn_weights:
             self.learn_w(data)
 
-    def process_centroids(self, data: Tensor, K: int):
+    @property
+    def w(self) -> Tensor:
         """
-        Process the centroids to select K representative centroids using K-Means clustering.
+        Get the weights w_k of the RBF kernels.
+
+        Returns:
+        Tensor (K,)
+            The weights of the RBF kernels
+        """
+        return torch.nn.functional.softplus(self.w_)
+
+    def process_centroids(self, K: int) -> None:
+        """
+        Process the centroids to select K representative centroids using K-Medoids clustering.
 
         Parameters:
-        data : Tensor (N,d)
-            The original data points, used to compute the clusters of centroids
         K : int
-            The number of centroids to select.
+            The number of centroids to select. If K=-1, use all centroids.
         """
-        kmeans = KMeans(n_clusters=K, random_state=1312)
-        kmeans.fit(data.cpu().numpy())
-        centroids = torch.from_numpy(kmeans.cluster_centers_).to(data.device, dtype=data.dtype)
-        new_K = centroids.shape[0]
-        return centroids, new_K
+        dst_mat = torch.cdist(self.centroids, self.centroids, p=2).sqrt().cpu().numpy()
+        kmedoids_model = kmedoids.KMedoids(
+            n_clusters=K, metric="precomputed", random_state=1312
+        )
+        kmedoids_model.fit(dst_mat)
+        self.centroids = self.centroids[kmedoids_model.medoid_indices_]
 
     def compute_bandwidths(
         self,
         data: Tensor,
-        centroids: Tensor,
         kappa: Tensor,
         min_cluster_size: int = 3,
         neighbor_rank: int = 5,
@@ -1428,46 +1443,71 @@ class RBFCometric(CoMetric):
         eps: float = 1e-12,
     ) -> Tensor:
         """
-        # Compute the bandwidths of the RBF kernels as :
-        # lambda_k = 1/2 * (kappa / Card(C_k) * sum_{c_j in C_k} ||c_k - c_j||^2) ^ (-2)
-        # where C_k is the cluster of centroids closest to c_k.
+        Compute the (squared) bandwidths of the RBF kernels as:
 
-        Compute the bandwidths of the RBF kernels.
-        The initial guess is given by the local in-cluster scale, which is the average
-        squared distance from each centroid to the points in its cluster.
-        To prevent pathological cases when the cluster cardinality is very small, we blend
-        this local scale with a more robust scale based on the distance to neighboring centroids.
+            tau_k^2 = kappa * scale_k^2
+
+        where scale_k^2 is an adaptive local-scale estimate for centroid c_k,
+        blended between two sources:
+
+        1. Local in-cluster scale (reliable when the cluster has enough points):
+            local_scale_k^2 = (1 / Card(C_k)) * sum_{x_i in C_k} ||c_k - x_i||^2
+        where C_k is the set of data points assigned to centroid c_k (i.e. c_k
+        is their nearest centroid).
+
+        2. Neighbor-based robust scale (used as a fallback when Card(C_k) is
+        small and the local estimate would be unreliable/pathological):
+            nn_scale_k^2 = ||c_k - c_(neighbor_rank)||^2
+        i.e. the squared distance from c_k to its `neighbor_rank`-th nearest
+        neighboring centroid (not the 1st, to avoid overly peaked kernels).
+        This is clamped between global quantiles of nn_scale^2 across all
+        centroids (min_scale_quantile, max_scale_quantile) so that outlier
+        centroids do not produce pathologically small or large bandwidths.
+
+        The two estimates are blended per-centroid via a reliability weight
+        r_k in [0, 1], based on the cluster cardinality relative to
+        min_cluster_size:
+
+            r_k     = clamp((Card(C_k) - 1) / (min_cluster_size - 1), 0, 1)
+            scale_k^2 = r_k * local_scale_k^2 + (1 - r_k) * nn_scale_k^2
+
+        The blended scale is then re-clamped to the same global [min, max]
+        bounds, and the final bandwidth is:
+
+            tau_k^2 = kappa * scale_k^2
 
         Parameters:
         -----------
-        data : Tensor (N,d)
-            The original data points, used to compute the clusters of centroids
-        centroids : Tensor (K,d)
-            The centroids of the clusters
+        data : Tensor (N, d)
+            The original data points, used to compute the clusters of centroids.
         kappa : Tensor
-            The scaling factor for the bandwidths
+            The scaling factor applied to the blended scale to obtain tau^2.
+        min_cluster_size : int
+            Cluster cardinality at or above which the local in-cluster scale is
+            trusted fully (reliability = 1).
+        neighbor_rank : int
+            Which nearest-neighbor centroid (1-indexed, excluding self) to use
+            for the robust fallback scale.
+        min_scale_quantile, max_scale_quantile : float
+            Quantiles (over all centroids) used to clamp the neighbor-based
+            scale, preventing outlier centroids from dominating.
+        eps : float
+            Small constant to avoid division by zero / degenerate scales.
 
         Returns:
-        bandwidths : Tensor (K,)
-            The computed bandwidths for each centroid
+        --------
+        tau_squared : Tensor (K,)
+            The computed squared bandwidths for each centroid.
         """
-        K = centroids.shape[0]
-
-        if K == 1:
-            dist2 = torch.cdist(centroids, data, p=2).pow(2).mean().clamp_min(eps)
-            return torch.tensor(
-                [0.5 / (kappa * kappa * dist2)],
-                device=centroids.device,
-                dtype=centroids.dtype,
-            )
+        K = self.centroids.shape[0]
 
         # Assign each sample to the closest centroid.
-        dst_data = torch.cdist(centroids, data, p=2)  # (K,N)
+        dst_data = torch.cdist(self.centroids, data, p=2)  # (K,N)
         closest_centroid = dst_data.argmin(dim=0)  # (N,)
 
         # Robust fallback scale from centroid geometry.
         # Use a higher-order neighbor to avoid over-peaked kernels when K is large.
-        dst_centroids = torch.cdist(centroids, centroids, p=2)
+        dst_centroids = torch.cdist(self.centroids, self.centroids, p=2)
         dst_centroids.fill_diagonal_(float("inf"))
         sorted_dst, _ = torch.sort(dst_centroids, dim=1)
         rank = min(max(neighbor_rank - 1, 0), max(K - 2, 0))
@@ -1480,12 +1520,12 @@ class RBFCometric(CoMetric):
         nn_scale2 = nn_scale2.clamp(min=min_scale2, max=max_scale2)
 
         # Local in-cluster scale. May be unreliable when cluster cardinality is very small.
-        local_scale2 = torch.zeros(K, device=centroids.device, dtype=centroids.dtype)
-        counts = torch.bincount(closest_centroid, minlength=K).to(centroids.dtype)
+        local_scale2 = torch.zeros(K, device=self.centroids.device, dtype=self.centroids.dtype)
+        counts = torch.bincount(closest_centroid, minlength=K).to(self.centroids.dtype)
         for k in range(K):
             cluster_points = data[closest_centroid == k]  # (Card(C_k),d)
             if cluster_points.shape[0] > 0:
-                c_k = centroids[k : k + 1]
+                c_k = self.centroids[k : k + 1]
                 dist2 = torch.cdist(c_k, cluster_points, p=2).pow(2)
                 local_scale2[k] = dist2.mean().clamp_min(eps)
 
@@ -1495,25 +1535,25 @@ class RBFCometric(CoMetric):
         scale2 = reliability * local_scale2 + (1.0 - reliability) * nn_scale2
         scale2 = scale2.clamp(min=min_scale2, max=max_scale2)
 
-        bandwidths = 0.5 / (kappa * kappa * scale2)
+        tau_squared = kappa * scale2
 
         # Fix any potential numerical issues with the bandwidths
-        if not torch.isfinite(bandwidths).all():
-            finite_mask = torch.isfinite(bandwidths)
+        if not torch.isfinite(tau_squared).all():
+            finite_mask = torch.isfinite(tau_squared)
             if finite_mask.any():
-                fill_value = bandwidths[finite_mask].median()
+                fill_value = tau_squared[finite_mask].median()
             else:
                 fill_value = torch.tensor(
-                    1.0, device=bandwidths.device, dtype=bandwidths.dtype
+                    1.0, device=tau_squared.device, dtype=tau_squared.dtype
                 )
-            bandwidths = torch.where(finite_mask, bandwidths, fill_value)
-        return bandwidths
+            tau_squared = torch.where(finite_mask, tau_squared, fill_value)
+        return tau_squared
 
-    def learn_w(self, data: Tensor, n_iters: int = 100) -> None:
+    def learn_w(self, data: Tensor, n_iters: int = 400) -> None:
         """
         Learn the weights w_k of the RBF kernels by minimizing the mean squared error between the cometric at the centroids and the cometric given by the RBF interpolation at the centroids.
         """
-        optimizer = torch.optim.Adam([self.w], lr=1e-2)
+        optimizer = torch.optim.Adam([self.w_], lr=1e-2)
         loss_list = []
         pbar = tqdm(range(n_iters), desc="Learning RBF weights", leave=False)
         for _ in pbar:
@@ -1524,7 +1564,7 @@ class RBFCometric(CoMetric):
             optimizer.step()
             loss_list.append(loss.item())
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-        print(f"Learned weights w. Final loss: {loss_list[-1]:.4f}")
+        self.loss_list = torch.tensor(loss_list)
 
     def h(self, x: Tensor) -> Tensor:
         """
@@ -1539,18 +1579,18 @@ class RBFCometric(CoMetric):
             The computed h(x) values
         """
         dst = torch.cdist(x, self.centroids, p=2)  # (B,K)
-        # To avoid numerical issues when bandwidths are inf and dst is zero
+        # To avoid numerical issues when tau_squared is inf and dst is zero
         # We set the corresponding rbf value to 1 in this case
         # which means that the RBF kernel is constant and doesn't contribute to the metric
-        rbf = self.bandwidths[None, :] * (dst**2)  # (B,K)
-        rbf = torch.exp(-rbf / 2)
-        # Set the RBF values to 1 where the bandwidth is infinite
-        rbf = torch.where(torch.isinf(self.bandwidths[None, :]), torch.ones_like(rbf), rbf)
+        rbf = dst**2 / (2 * self.tau_squared[None, :] + 1e-12)  # (B,K)
+        rbf = torch.exp(-rbf)
+        # Set the RBF values to 1 where the tau_squared is infinite
+        rbf = torch.where(torch.isinf(self.tau_squared[None, :]), torch.ones_like(rbf), rbf)
         # Keep mixture weights positive and normalized.
         h_x = torch.einsum("k,bk->b", self.w, rbf)  # (B,)
         return h_x
 
-    def forward(self, x: Tensor) -> Tensor:
+    def cometric_tensor(self, x: Tensor) -> Tensor:
         h_x = self.h(x)[:, None]  # (B,1)
         G_inv = h_x.expand(-1, x.shape[1]) + self.reg_coef * self.eye(x)  # (B,d)
         return G_inv
