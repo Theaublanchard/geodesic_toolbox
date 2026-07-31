@@ -284,6 +284,7 @@ def get_mf_image(
 ) -> torch.Tensor:
     """
     Compute the log magnification factor on the latent space so as to visualize the distortion of the space.
+    We thus compute log(sqrt(det(G(z)))) = 0.5 * log(det(G(z))) = -0.5 * log(det(G_inv(z)))
 
     Parameters:
     ----------
@@ -337,8 +338,10 @@ def get_mf_image(
     with torch.no_grad():
         # batch computation to avoid memory issues
         for i in pbar:
-            log_mf_image[i : i + max_b_size] = fn(Q[i : i + max_b_size].to(device))
+            log_mf_image[i : i + max_b_size] = 0.5 * fn(Q[i : i + max_b_size].to(device))
     log_mf_image = rearrange(log_mf_image, "(w h) -> w h", w=W, h=H).T
+    if not use_mf_metric:
+        log_mf_image = -log_mf_image
     return log_mf_image.cpu()
 
 
