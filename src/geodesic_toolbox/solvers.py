@@ -3645,8 +3645,8 @@ class GeodesicSpline(torch.nn.Module):
     ):
         super().__init__()
 
-        self.register_buffer("q0", q0)
-        self.register_buffer("q1", q1)
+        self.register_buffer("q0", q0.clone().detach())
+        self.register_buffer("q1", q1.clone().detach())
 
         if control_points is not None:
             n_control_points = control_points.shape[1]
