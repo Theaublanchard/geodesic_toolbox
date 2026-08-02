@@ -2356,7 +2356,7 @@ class MatsumotoMetrics(FinslerMetric):
 
     def forward(self, x: Tensor, v: Tensor):
         """Compute F(x,v) = alpha**2 / (alpha - beta)"""
-        alpha = self.alpha_inv.metric(x, v).sqrt()  # norm of v w.r.t. alpha
+        alpha = self.alpha_inv.metric(x, v)  # norm of v w.r.t. alpha
         beta = self.beta(x, v)
         return alpha**2 / (alpha - beta)  # Matsumoto metric formula
 
@@ -2450,7 +2450,7 @@ class RandersMetrics(FinslerMetric):
         return self.beta * beta
 
     def forward(self, x: Tensor, v: Tensor) -> Tensor:
-        alpha = self.base_cometric.metric(x, v).sqrt()
+        alpha = self.base_cometric.metric(x, v)
         beta = self.beta_form(x, v)
         F = alpha + beta
         return F
@@ -2473,7 +2473,7 @@ class RandersMetrics(FinslerMetric):
             Fundamental tensor of the Randers metric at z in the direction of v
         """
         F_z_v = self.forward(z, v)
-        v_norm = self.base_cometric.metric(z, v).sqrt()
+        v_norm = self.base_cometric.metric(z, v)
         b = self.beta * self.omega(z)
         a = self.base_cometric.metric_tensor(z)
         if self.base_cometric.is_diag:
@@ -2515,7 +2515,7 @@ class RandersMetrics(FinslerMetric):
             Inverse of the fundamental tensor of the Randers metric at q in the direction of v
         """
         F = self.forward(q, v)
-        alpha = self.base_cometric.metric(q, v).sqrt()
+        alpha = self.base_cometric.metric(q, v)
 
         a = self.base_cometric.metric_tensor(q)
         if self.base_cometric.is_diag:
