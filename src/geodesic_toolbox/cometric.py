@@ -458,6 +458,9 @@ class SumOfCometric(CoMetric):
             return G_1 + G_2
         return G_1 + G_2
 
+    def dot(self, q: Tensor, u: Tensor, v: Tensor) -> Tensor:
+        return self.cometric1.dot(q, u, v) + self.cometric2.dot(q, u, v)
+
     def forward(self, q: Tensor) -> Tensor:
         if self.is_diag:
             G = self.metric_tensor(q)
@@ -912,6 +915,35 @@ class PBIG_Cometric_Gaussian(CoMetric):
         kl = kl.sum(dim=tuple(range(1, len(dims) + 1)))  # Sum over all dimensions except batch
         return kl
 
+    def dot(self, z: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Computes u^T G(q) v for a batch of points q at tangent vectors u and v.
+        Here we use the polarization identity to avoid to compute the metric tensor explicitly.
+        Ie : 
+        u^T G(q) v = 1/4 * ( (u+v)^T G(q) (u+v) - (u-v)^T G(q) (u-v) )
+
+        Parameters:
+        -----------
+        q : Tensor (b, d)
+            Batch of points
+        u : Tensor (b, d)
+            First tangent vector
+        v : Tensor (b, d)
+            Second tangent vector
+
+        Returns:
+        -----------
+        res : Tensor (b,)
+            u^T G(q) v
+        """
+        uv_plus = u + v
+        uv_minus = u - v
+
+        fst = self.energy(z, uv_plus)
+        snd = self.energy(z, uv_minus)
+        dot_ = 0.25 * (fst - snd)
+        return dot_
+
     def energy(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         """
         Computes p^TG(q)p for a batch of tangent vectors p at points q.
@@ -926,7 +958,8 @@ class PBIG_Cometric_Gaussian(CoMetric):
 
         Returns:
         -------
-        res : Tensor (b,) p^TG(q)p
+        res : Tensor (b,)
+            p^TG(q)p
         """
         x_hat_base, logvar_base = self.decoder(z)
         normal_base = torch.distributions.Normal(x_hat_base, torch.exp(0.5 * logvar_base))
@@ -1070,6 +1103,35 @@ class PBIG_Cometric(CoMetric):
         base_distrib = self.decoder(z)
         plus_distrib = self.decoder(z + p)
         return torch.distributions.kl_divergence(base_distrib, plus_distrib)
+
+    def dot(self, z: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Computes u^T G(q) v for a batch of points q at tangent vectors u and v.
+        Here we use the polarization identity to avoid to compute the metric tensor explicitly.
+        Ie : 
+        u^T G(q) v = 1/4 * ( (u+v)^T G(q) (u+v) - (u-v)^T G(q) (u-v) )
+
+        Parameters:
+        -----------
+        q : Tensor (b, d)
+            Batch of points
+        u : Tensor (b, d)
+            First tangent vector
+        v : Tensor (b, d)
+            Second tangent vector
+
+        Returns:
+        -----------
+        res : Tensor (b,)
+            u^T G(q) v
+        """
+        uv_plus = u + v
+        uv_minus = u - v
+
+        fst = self.energy(z, uv_plus)
+        snd = self.energy(z, uv_minus)
+        dot_ = 0.25 * (fst - snd)
+        return dot_
 
     def metric(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         """
