@@ -135,19 +135,54 @@ class GeodesicDistanceSolver(torch.nn.Module):
         """
         pass
 
-    def compute_distance(self, traj_q: Tensor) -> Tensor:
+    def compute_energy(self, traj_q: Tensor, use_midpoints: bool = True) -> Tensor:
+        """Given the trajectory, computes its energy according to the metric
+
+        E = 1/2 int_0^1 g_{q(t)}(dot{q}(t), dot{q}(t)) dt
+
+        Parameters:
+        -----------
+        traj_q : Tensor (b,n_pts,d)
+            Points on the trajectories
+        use_midpoints : bool
+            Whether to use the midpoints of the segments to compute the energy or not.
+            If False, the energy is computed using the starting point of each segment.
+
+        Returns:
+        --------
+        energies : Tensor, (b,)
+            Energies of the trajectories
+        """
+        dq = torch.diff(traj_q, dim=1)
+        q = (traj_q[:, 1:, :] + traj_q[:, :-1, :]) / 2
+
+        energies = [self.cometric.energy(m, seg) for m, seg in zip(q, dq)]
+        energies = torch.stack(energies)
+
+        # Add a ReLU to avoid negative energies due to numerical errors
+        energies = 0.5 * energies.relu().sum(dim=1)
+        return energies
+
+    def compute_distance(self, traj_q: Tensor, use_midpoints: bool = True) -> Tensor:
         """Given the trajectory, computes its length according to the metric
 
+        dst = int_0^1 sqrt{g_{q(t)}(dot{q}(t), dot{q}(t))} dt
+
         Params :
-        traj_q : Tensor (b,n_pts,d), points on the trajectories
+        traj_q : Tensor (b,n_pts,d)
+            Points on the trajectories
+        use_midpoints : bool
+            Whether to use the midpoints of the segments to compute the distance or not.
+            If False, the distance is computed using the starting point of each segment. This is less accurate but faster.
 
         Output :
         distances : Tensor, (b,), distances of the trajectories
         """
-        traj_front = traj_q[:, 1:, :]
-        traj_back = traj_q[:, :-1, :]
-        segments = traj_front - traj_back
-        midpoints = (traj_front + traj_back) / 2
+        dq = torch.diff(traj_q, dim=1)
+        if use_midpoints:
+            q = (traj_q[:, 1:, :] + traj_q[:, :-1, :]) / 2
+        else:
+            q = traj_q[:, :-1, :]
 
         # # This version uses way too much memory
         # segments = rearrange(segments, "b n d -> (b n) d")
@@ -157,11 +192,11 @@ class GeodesicDistanceSolver(torch.nn.Module):
         # distances = rearrange(distances, "(b n) -> b n", b=traj_q.shape[0])
 
         # # This version is more memory efficient but slower
-        distances = [self.cometric.metric(m, seg) for m, seg in zip(midpoints, segments)]
+        distances = [self.cometric.metric(m, seg) for m, seg in zip(q, dq)]
         distances = torch.stack(distances)
 
         # Add a ReLU to avoid negative distances due to numerical errors
-        distances = distances.relu().sqrt().sum(dim=1)
+        distances = distances.relu().sum(dim=1)
         return distances
 
     def forward(self, q0: Tensor, q1: Tensor) -> Tensor:
@@ -2433,9 +2468,9 @@ class GEORCE(GeodesicDistanceSolver):
             The total energy of the geodesic trajectory.
         """
         traj = torch.cat([z0[None, :], z_t, zT[None, :]], dim=0)  # (T+1, d)
-        dx = traj[1:] - traj[:-1]  # (T, d)
-        energy = self.cometric.metric(traj[:-1], dx)
-        return energy.sum()
+        d_traj = torch.diff(traj, dim=0)  # (T, d)
+        energy = self.cometric.energy(traj[:-1], d_traj)  # (T,)
+        return 0.5 * energy.sum()
 
     def grad_E(self, z_t: Tensor, z0: Tensor, zT: Tensor) -> Tensor:
         """
@@ -2455,7 +2490,6 @@ class GEORCE(GeodesicDistanceSolver):
         grad: Tensor (T-1, d)
             The gradient of the energy with respect to the trajectory points z_t.
         """
-
         E = self.compute_energy(z_t, z0, zT)
         return torch.autograd.grad(E, z_t, materialize_grads=True)[0]
 
@@ -2581,7 +2615,7 @@ class GEORCE(GeodesicDistanceSolver):
         """
         full_traj = torch.cat([x_0[None, :], x_t, x_T[None, :]], dim=0)  # (T, d)
         dx = full_traj[1:] - full_traj[:-1]  # (T-1, d)
-        distance = self.cometric.metric(full_traj[:-1], dx).sqrt()  # (T-1,)
+        distance = self.cometric.metric(full_traj[:-1], dx)  # (T-1,)
         return distance.sum()
 
     def main_stop_cond(self, norm_grad_E_t: Tensor, i: int) -> bool:
@@ -3877,7 +3911,7 @@ class ExpMapRiemann(torch.nn.Module):
         H : torch.Tensor (b,)
             Hamiltonian value
         """
-        H = self.cometric.cometric(q, p)
+        H = self.cometric.dual_energy(q, p)
         return 0.5 * H
 
     def forward(self, q0: Tensor, v0: Tensor) -> tuple[Tensor, Tensor]:
