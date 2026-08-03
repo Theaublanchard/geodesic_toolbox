@@ -1034,8 +1034,16 @@ class PBIG_Cometric_Gaussian(CoMetric):
                     x_hat_plus_j, torch.exp(0.5 * logvar_plus_j)
                 )
 
+                z_plus_ij = z.clone()
+                z_plus_ij[:, i] += self.epsilon
+                z_plus_ij[:, j] += self.epsilon
+                x_hat_plus_ij, logvar_plus_ij = self.decoder(z_plus_ij)
+                normal_plus_ij = torch.distributions.Normal(
+                    x_hat_plus_ij, torch.exp(0.5 * logvar_plus_ij)
+                )
+
                 g[:, i, j] = (
-                    self.kl(normal_base, normal_plus_i) - self.kl(normal_base, normal_plus_j)
+                    self.kl(normal_base, normal_plus_ij) - self.kl(normal_base, normal_plus_i) - self.kl(normal_base, normal_plus_j)
                 ) / (self.epsilon**2)
 
                 g[:, j, i] = g[:, i, j]
@@ -1188,8 +1196,14 @@ class PBIG_Cometric(CoMetric):
                 z_plus_j[:, j] += self.epsilon
                 plus_distrib_j = self.decoder(z_plus_j)
 
+                z_plus_ij = z.clone()
+                z_plus_ij[:, i] += self.epsilon
+                z_plus_ij[:, j] += self.epsilon
+                plus_distrib_ij = self.decoder(z_plus_ij)
+
                 g[:, i, j] = (
-                    torch.distributions.kl_divergence(base_distrib, plus_distrib_i)
+                    torch.distributions.kl_divergence(base_distrib, plus_distrib_ij)
+                    - torch.distributions.kl_divergence(base_distrib, plus_distrib_i)
                     - torch.distributions.kl_divergence(base_distrib, plus_distrib_j)
                 ) / (self.epsilon**2)
 
