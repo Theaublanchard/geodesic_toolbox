@@ -1405,9 +1405,181 @@ class FisherRaoCometric(CoMetric):
 ################################################################
 # Interpolation cometrics
 ################################################################
+
+
+# First some utils functions
+def compute_kmedoids(data: Tensor, K: int) -> np.ndarray:
+    """
+    Compute the K-Medoids clustering of the data and return the indices of the medoids.
+
+    Parameters:
+    -----------
+    data : Tensor (N,d)
+        The data to cluster
+    K : int
+        The number of clusters
+
+    Returns:
+    -----------
+    medoid_indices : np.ndarray (K,)
+        The indices of the medoids in the original data
+    """
+    dst_mat = torch.cdist(data, data, p=2).sqrt().cpu().detach().numpy()
+    k_medoids_model = kmedoids.KMedoids(n_clusters=K, metric="precomputed", random_state=1312)
+    k_medoids_model.fit(dst_mat)
+    return k_medoids_model.medoid_indices_
+
+
+def compute_global_temperature_square(centroids: Tensor, neighbor_k: int = 1) -> float:
+    """
+    Compute the global temperature for the gaussian interpolation of the cometric at the centroids.
+    The temperature is set to the maximum of the n-th smallest distance between centroids.
+
+    Parameters:
+    -----------
+    centroids : Tensor (K,d)
+        The centroids of the clusters
+    neighbor_k : int
+        The index of the neighbor to consider for the distance computation. Default is 1 (second nearest neighbor).
+
+    Returns:
+    -----------
+    temperature_square : float
+        The global temperature for the gaussian interpolation of the cometric at the centroids.
+    """
+    dst_mat = torch.cdist(centroids, centroids, p=2)
+    dst_mat[dst_mat == 0] = float("inf")  # Avoid zero self distances
+    sorted_distances, _ = torch.sort(dst_mat, dim=1)
+    second_min_distances = sorted_distances[
+        :, neighbor_k
+    ]  # Get the n-th smallest distance for each centroid
+    return second_min_distances.max() ** 2
+
+
+def compute_centroid_scales(
+    centroids: Tensor,
+    data: Tensor,
+    kappa: Tensor,
+    min_cluster_size: int = 3,
+    neighbor_rank: int = 5,
+    min_scale_quantile: float = 0.25,
+    max_scale_quantile: float = 0.95,
+    eps: float = 1e-12,
+) -> Tensor:
+    """
+    Compute the (squared) bandwidths of the RBF kernels as:
+
+        tau_k^2 = kappa * scale_k^2
+
+    where scale_k^2 is an adaptive local-scale estimate for centroid c_k,
+    blended between two sources:
+
+    1. Local in-cluster scale (reliable when the cluster has enough points):
+        local_scale_k^2 = (1 / Card(C_k)) * sum_{x_i in C_k} ||c_k - x_i||^2
+    where C_k is the set of data points assigned to centroid c_k (i.e. c_k
+    is their nearest centroid).
+
+    2. Neighbor-based robust scale (used as a fallback when Card(C_k) is
+    small and the local estimate would be unreliable/pathological):
+        nn_scale_k^2 = ||c_k - c_(neighbor_rank)||^2
+    i.e. the squared distance from c_k to its `neighbor_rank`-th nearest
+    neighboring centroid (not the 1st, to avoid overly peaked kernels).
+    This is clamped between global quantiles of nn_scale^2 across all
+    centroids (min_scale_quantile, max_scale_quantile) so that outlier
+    centroids do not produce pathologically small or large bandwidths.
+
+    The two estimates are blended per-centroid via a reliability weight
+    r_k in [0, 1], based on the cluster cardinality relative to
+    min_cluster_size:
+
+        r_k     = clamp((Card(C_k) - 1) / (min_cluster_size - 1), 0, 1)
+        scale_k^2 = r_k * local_scale_k^2 + (1 - r_k) * nn_scale_k^2
+
+    The blended scale is then re-clamped to the same global [min, max]
+    bounds, and the final bandwidth is:
+
+        tau_k^2 = kappa * scale_k^2
+
+    Parameters:
+    -----------
+    centroids : Tensor (K, d)
+        The centroids of the clusters, used to compute the neighbor-based scale.
+    data : Tensor (N, d)
+        The original data points, used to compute the clusters of centroids.
+    kappa : Tensor
+        The scaling factor applied to the blended scale to obtain tau^2.
+    min_cluster_size : int
+        Cluster cardinality at or above which the local in-cluster scale is
+        trusted fully (reliability = 1).
+    neighbor_rank : int
+        Which nearest-neighbor centroid (1-indexed, excluding self) to use
+        for the robust fallback scale.
+    min_scale_quantile, max_scale_quantile : float
+        Quantiles (over all centroids) used to clamp the neighbor-based
+        scale, preventing outlier centroids from dominating.
+    eps : float
+        Small constant to avoid division by zero / degenerate scales.
+
+    Returns:
+    --------
+    tau_squared : Tensor (K,)
+        The computed squared bandwidths for each centroid.
+    """
+    K = centroids.shape[0]
+
+    # Assign each sample to the closest centroid.
+    dst_data = torch.cdist(centroids, data, p=2)  # (K,N)
+    closest_centroid = dst_data.argmin(dim=0)  # (N,)
+
+    # Robust fallback scale from centroid geometry.
+    # Use a higher-order neighbor to avoid over-peaked kernels when K is large.
+    dst_centroids = torch.cdist(centroids, centroids, p=2)  # (K,K)
+    dst_centroids.fill_diagonal_(float("inf"))
+    sorted_dst, _ = torch.sort(dst_centroids, dim=1)
+    rank = min(max(neighbor_rank - 1, 0), max(K - 2, 0))  # (K,)
+    nn_dist = sorted_dst[:, rank]  # (K,)
+    nn_scale2 = nn_dist.pow(2).clamp_min(eps)
+
+    # Global robust floor/ceiling so outlier clusters do not dominate smoothness.
+    min_scale2 = torch.quantile(nn_scale2, min_scale_quantile).clamp_min(eps)
+    max_scale2 = torch.quantile(nn_scale2, max_scale_quantile).clamp_min(eps)
+
+    # Local in-cluster scale. May be unreliable when cluster cardinality is very small.
+    local_scale2 = torch.zeros(K, device=centroids.device, dtype=centroids.dtype)
+    counts = torch.bincount(closest_centroid, minlength=K).to(centroids.dtype)
+    for k in range(K):
+        cluster_points = data[closest_centroid == k]  # (Card(C_k),d)
+        if cluster_points.shape[0] > 0:
+            c_k = centroids[k : k + 1]
+            dist2 = torch.cdist(c_k, cluster_points, p=2).pow(2)
+            local_scale2[k] = dist2.mean().clamp_min(eps)
+
+    # Blend local scale with centroid-neighborhood scale.
+    # For small clusters (K ~ N), this prevents pathological very narrow kernels.
+    reliability = ((counts - 1) / max(min_cluster_size - 1, 1)).clamp(0.0, 1.0)
+    scale2 = reliability * local_scale2 + (1.0 - reliability) * nn_scale2
+    scale2 = scale2.clamp(min=min_scale2, max=max_scale2)
+
+    tau_squared = kappa * scale2
+
+    # Fix any potential numerical issues with the bandwidths
+    if not torch.isfinite(tau_squared).all():
+        finite_mask = torch.isfinite(tau_squared)
+        if finite_mask.any():
+            fill_value = tau_squared[finite_mask].median()
+        else:
+            fill_value = torch.tensor(1.0, device=tau_squared.device, dtype=tau_squared.dtype)
+        tau_squared = torch.where(finite_mask, tau_squared, fill_value)
+    return tau_squared
+
+
 class CentroidsCometric(CoMetric):
     """Cometric based on the cometric computed on centroids.
     New cometric is computed as a gaussian interpolation of the cometric at the centroids.
+
+    G^{-1}(z) = sum_{k=1}^K w_k(z) G^{-1}(c_k)
+    Where w_k(z) = exp(-||z-c_k||^2 / (2*tau_k^2))         if not metric_weight
+                 = exp(-||z-c_k||^2_G(c_k) / (2*tau_k^2))  else
 
     Parameters:
     -----------
@@ -1415,58 +1587,77 @@ class CentroidsCometric(CoMetric):
         The centroids of the clusters
     cometric_centroids: Tensor (K,d,d)
         The cometric tensor at the centroids
-    temperature : float
-        The temperature of the gaussian kernel. It controls the smoothness of the interpolation.
     reg_coef : float
         Regularization coefficient for the cometric
     K: int, Default None
+        If None, uses all the centroids
         If not None, the number of centroids to use, computed by KMedoids clustering.
-        If K=-1, use all centroids and compute the temperature automatically.
-        Auto set the temperature to the maximum minimum distance between centroids.
     metric_weight: bool
         If True, the interpolation weights is given by N(c_k,Sigma_k) else it is N(c_k,Id).
+    kappa: float
+        The scaling factor for the bandwidths of the RBF kernels.
+    use_global_temperature: bool
+        If True, the temperature is the same for all centroids.
     """
 
     def __init__(
         self,
-        centroids: Tensor = None,
-        cometric_centroids: Tensor = None,
-        temperature: float = 1.0,
+        centroids: Tensor,
+        cometric_centroids: Tensor,
         reg_coef: float = 1e-3,
         K: int = None,
         metric_weight: bool = False,
-        temperature_scale: float = 1.0,
+        kappa: float = 1.0,
+        use_global_temperature: bool = False,
     ):
         super().__init__()
 
-        assert (centroids is not None and cometric_centroids is not None) or (
-            centroids is None and cometric_centroids is None
-        ), "Either both centroids and cometric_centroids should be provided or none."
-
-        if centroids is not None:
-            self.register_buffer("centroids", centroids)
-        if cometric_centroids is not None:
-            self.register_buffer("cometric_centroids", cometric_centroids)
-            if cometric_centroids.ndim == 2:
-                self.is_diag = True
-            else:
-                self.is_diag = False
-        self.register_buffer("temperature", Tensor([temperature]))
-        self.register_buffer("reg_coef", Tensor([reg_coef]))
-        self.register_buffer("temperature_scale", Tensor([temperature_scale]))
-
-        if K is not None and centroids is not None:
-            self.process_centroids(K)
-        elif K is None and centroids is not None:
-            self.K = self.centroids.size(0)
+        self.register_buffer("centroids", centroids)
+        # if cometric_centroids is not None:
+        #     self.register_buffer("cometric_centroids", cometric_centroids)
+        if cometric_centroids.ndim == 2:
+            self.is_diag = True
         else:
+            self.is_diag = False
+        cometric_centroids = self.assess_cometric_tensor_symmetry(cometric_centroids)
+        self.register_buffer("cometric_centroids", cometric_centroids)
+        self.register_buffer("reg_coef", Tensor([reg_coef]))
+
+        if K is not None:
+            if K > self.centroids.shape[0]:
+                print(
+                    f"Warning: K={K} is greater than the number of centroids {self.centroids.shape[0]}. Using all centroids."
+                )
+                K = self.centroids.shape[0]
+            centroids_idx = compute_kmedoids(self.centroids, K)
+            self.centroids = self.centroids[centroids_idx]
+            self.cometric_centroids = self.cometric_centroids[centroids_idx]
             self.K = K
 
-        if cometric_centroids is not None:
-            self.cometric_centroids: Tensor = self.assess_cometric_tensor_symmetry(
-                self.cometric_centroids
+        if use_global_temperature:
+            tau_squared = compute_global_temperature_square(self.centroids)
+            tau_squared = (
+                kappa
+                * tau_squared
+                * torch.ones(self.centroids.shape[0], device=self.centroids.device)
             )
+        else:
+            tau_squared = compute_centroid_scales(self.centroids, self.centroids, kappa)
+        self.register_buffer("tau_squared", tau_squared)
+
         self.metric_weight = metric_weight
+        # if K is not None and centroids is not None:
+        #     self.process_centroids(K)
+        # elif K is None and centroids is not None:
+        #     self.K = self.centroids.size(0)
+        # else:
+        #     self.K = K
+
+        # if cometric_centroids is not None:
+        #     self.cometric_centroids: Tensor = self.assess_cometric_tensor_symmetry(
+        #         self.cometric_centroids
+        #     )
+        # self.metric_weight = metric_weight
 
     def assess_cometric_tensor_symmetry(self, cometric_centroids: Tensor) -> Tensor:
         """
@@ -1507,71 +1698,6 @@ class CentroidsCometric(CoMetric):
             cometric_centroids = (cometric_centroids + cometric_centroids.mT) / 2
         return cometric_centroids
 
-    def process_centroids(self, K: int) -> None:
-        """
-        Process the centroids to select K representative centroids using K-Medoids clustering.
-
-        Parameters:
-        K : int
-            The number of centroids to select. If K=-1, use all centroids.
-        """
-        if K <= self.centroids.shape[0] and K > 0:
-            self.K = K
-            dst_mat = torch.cdist(self.centroids, self.centroids, p=2).sqrt().cpu().numpy()
-            kmedoids_model = kmedoids.KMedoids(
-                n_clusters=K, metric="precomputed", random_state=1312
-            )
-            kmedoids_model.fit(dst_mat)
-            centroids_idx = kmedoids_model.medoid_indices_
-
-            self.centroids = self.centroids[centroids_idx]
-            self.cometric_centroids = self.cometric_centroids[centroids_idx]
-        elif K == -1:
-            self.K = self.centroids.shape[0]
-        else:
-            print(
-                f"Warning: K={K} is greater than the number of centroids {self.centroids.shape[0]}. Using all centroids."
-            )
-            self.K = self.centroids.shape[0]
-        self.set_temperature()
-
-    def set_temperature(self) -> None:
-        """
-        Set the temperature to the maximum minimum distance between centroids scaled by temperature_scale.
-        """
-        dst_mat = torch.cdist(self.centroids, self.centroids, p=2)
-        dst_mat[dst_mat == 0] = float("inf")  # Avoid zero self distances
-        # min_distances, _ = dst_mat.min(dim=1)
-        # self.temperature = min_distances.max()
-        # Find distance to second closest centroid
-        sorted_distances, _ = torch.sort(dst_mat, dim=1)
-        second_min_distances = sorted_distances[:, 1]
-        self.temperature = (
-            self.temperature_scale.to(self.centroids.device) * second_min_distances.max()
-        )
-
-    def load_state_dict(self, state_dict: dict, strict=True, assign=False) -> None:
-        """
-        Load the state dict of the model.
-
-        Parameters:
-        state_dict : dict
-            State dict to load
-        strict : bool
-            Whether to strictly enforce that the keys in state_dict match the keys returned by this module's state_dict() function.
-        assign : bool
-            Whether to assign the values in state_dict to the model's parameters.
-        """
-
-        # Just to accomodate loading a state_dict with centroids and cometric_centroids
-        if "centroids" in state_dict and not hasattr(self, "centroids"):
-            self.register_buffer("centroids", state_dict["centroids"])
-        if "cometric_centroids" in state_dict and not hasattr(self, "cometric_centroids"):
-            self.register_buffer("cometric_centroids", state_dict["cometric_centroids"])
-            if self.cometric_centroids.ndim == 2:
-                self.is_diag = True
-        return super().load_state_dict(state_dict, strict, assign)
-
     def forward(self, z: Tensor) -> Tensor:
         # Expand the computation to save memory when latentdim >> 1
         if self.metric_weight:
@@ -1601,8 +1727,7 @@ class CentroidsCometric(CoMetric):
             cross_term = torch.einsum("bd,kd->bk", z, self.centroids)  # (b,k)
 
         dz = z_term + c_term - 2 * cross_term
-        tau = self.temperature.to(z.device, dtype=z.dtype)
-        weights = torch.exp(-(dz**2) / (2 * tau**2))  # (b,K)
+        weights = torch.exp(-(dz**2) / (2 * self.tau_squared))  # (b,K)
         G_inv = self.cometric_centroids  # (k,d,d) | (k,d)
         if not self.is_diag:
             G_inv = torch.einsum("bk,kij->bij", weights, G_inv)
@@ -1613,7 +1738,7 @@ class CentroidsCometric(CoMetric):
         return G_inv
 
     def extra_repr(self) -> str:
-        return f"K={self.K}, temperature={self.temperature.item():.3f}, temp_scale={self.temperature_scale.item()} reg_coef={self.reg_coef.item():.3f}, metric_weight={self.metric_weight}, is_diag={self.is_diag}"
+        return f"K={self.K}, reg_coef={self.reg_coef.item():.3f}, metric_weight={self.metric_weight}, is_diag={self.is_diag}, tau_squared={self.tau_squared}"
 
 
 class LANDCometric(CoMetric):
@@ -1621,8 +1746,10 @@ class LANDCometric(CoMetric):
     Cometric based on the LAND metric.
     The cometric is given by:
     G_inv(x) = diag(h(x)) + reg_coef * Id
-    where h(x) = sum_i (x_i^alpha - x^alpha)^2 exp(-||x_i - x||^2 / (2 * sigma^2))
-    where x_i are the centroids, and alpha is a parameter that controls the shape of the metric.
+    where h(x) = sum_k w_k (x_k^alpha - x^alpha)^2
+    Where w_k(x) = exp(-||x_k - x||^2 / (2 * sigma^2_k))        if not metric_weight
+                 = exp(-||x_k - x||^2_G(x_k) / (2 * sigma^2_k)) else
+    and where x_k are the centroids, and alpha is a parameter that controls the shape of the metric.
 
     Parameters:
     -----------
@@ -1630,23 +1757,27 @@ class LANDCometric(CoMetric):
         The centroids of the clusters
     alpha : int
         The alpha parameter of the LAND metric. It controls the shape of the metric. Default to 1.
-    sigma : float
-        The sigma parameter of the LAND metric. It controls the width of the Gaussian kernel.
-        Default to None, ie will be tuned automatically.
+    kappa : float
+        The kappa parameter of the LAND metric. It controls the width of the Gaussian kernel.
+        Default to 1.0.
     reg_coef : float
         The regularization coefficient. Default to 1e-5.
     K: int, Default None
         If not None, the number of centroids to use, computed by KMedoids clustering.
         If None, uses all centroids.
+    use_global_temp: bool
+        If True, the sigma parameter is the same for all centroids.
+        Otherwise, the sigma parameter is not the same for all centroids.
     """
 
     def __init__(
         self,
         centroids: Tensor,
         alpha: int = 1,
-        sigma: float = None,
+        kappa: float = 1.0,
         reg_coef: float = 1e-3,
         K: int = None,
+        use_global_temp: bool = False,
     ):
         super().__init__(is_diag=True)
 
@@ -1660,9 +1791,6 @@ class LANDCometric(CoMetric):
 
         self.register_buffer("centroids", centroids)
         self.register_buffer("alpha", Tensor([alpha]))
-        if sigma is None:
-            sigma = self.set_sigma()
-        self.register_buffer("sigma", Tensor([sigma]))
         self.register_buffer("reg_coef", Tensor([reg_coef]))
 
         if K is not None:
@@ -1671,39 +1799,22 @@ class LANDCometric(CoMetric):
                     f"Warning: K={K} is greater than the number of centroids {self.centroids.shape[0]}. Using all centroids."
                 )
                 K = self.centroids.shape[0]
-            self.process_centroids(K)
+            self.centroids = self.centroids[compute_kmedoids(self.centroids, K)]
 
         self.K = self.centroids.shape[0]
         self.d = self.centroids.shape[1]
-        self.sigma = self.set_sigma()
-
-    def process_centroids(self, K: int) -> None:
-        """
-        Process the centroids to select K representative centroids using K-Medoids clustering.
-
-        Parameters:
-        K : int
-            The number of centroids to select. If K=-1, use all centroids.
-        """
-        dst_mat = torch.cdist(self.centroids, self.centroids, p=2).sqrt().cpu().numpy()
-        kmedoids_model = kmedoids.KMedoids(
-            n_clusters=K, metric="precomputed", random_state=1312
-        )
-        kmedoids_model.fit(dst_mat)
-        self.centroids = self.centroids[kmedoids_model.medoid_indices_]
-
-    def set_sigma(self) -> float:
-        """
-        Set the sigma to the maximum minimum distance between centroids scaled by sigma_scale.
-        """
-        dst_mat = torch.cdist(self.centroids, self.centroids, p=2)
-        dst_mat[dst_mat == 0] = float("inf")  # Avoid zero self distances
-        # min_distances, _ = dst_mat.min(dim=1)
-        # self.sigma = min_distances.max()
-        # Find distance to second closest centroid
-        sorted_distances, _ = torch.sort(dst_mat, dim=1)
-        second_min_distances = sorted_distances[:, 1]
-        return second_min_distances.max()
+        if use_global_temp:
+            tau_squared = compute_global_temperature_square(self.centroids)  # float
+            tau_squared = (
+                kappa
+                * tau_squared
+                * torch.ones(self.K, device=self.centroids.device, dtype=self.centroids.dtype)
+            )
+        else:
+            tau_squared = compute_centroid_scales(
+                self.centroids, self.centroids, kappa=kappa
+            )  # (K,)
+        self.register_buffer("tau_squared", tau_squared)
 
     def h(self, x: Tensor) -> Tensor:
         """
@@ -1721,7 +1832,7 @@ class LANDCometric(CoMetric):
         centroids_alpha = self.centroids**self.alpha  # (K,d)
         diff = x_alpha[:, None, :] - centroids_alpha[None, :, :]  # (B,K,d)
         dst = torch.cdist(x, self.centroids, p=2)  # (B,K)
-        weights = torch.exp(-(dst**2) / (2 * self.sigma**2))  # (B,K)
+        weights = torch.exp(-(dst**2) / (2 * self.tau_squared[None, :]))  # (B,K)
         h_x = weights[:, :, None] * (diff**2)  # (B,K,d)
         h_x = h_x.sum(dim=1)  # (B,d)
         return h_x
@@ -1732,7 +1843,7 @@ class LANDCometric(CoMetric):
         return G_inv
 
     def extra_repr(self) -> str:
-        return f"K={self.K}, alpha={self.alpha.item()}, sigma={self.sigma.item()}, reg_coef={self.reg_coef.item()}"
+        return f"K={self.K}, alpha={self.alpha.item()}, reg_coef={self.reg_coef.item():.3f}, tau_squared={self.tau_squared}"
 
 
 class LANDRBFCometric(CoMetric):
@@ -1777,9 +1888,6 @@ class LANDRBFCometric(CoMetric):
         self.register_buffer("kappa", Tensor([kappa]))
 
         self.register_buffer("centroids", data)
-        self.register_buffer(
-            "tau", torch.ones(data.shape[0], device=data.device, dtype=data.dtype)
-        )
 
         if K is not None:
             if K > data.shape[0]:
@@ -1787,18 +1895,12 @@ class LANDRBFCometric(CoMetric):
                     f"Warning: K={K} is greater than the number of data points {data.shape[0]}. Using all data points."
                 )
                 K = data.shape[0]
-            self.process_centroids(K)
+            self.centroids = self.centroids[compute_kmedoids(self.centroids, K)]
 
         self.K = self.centroids.shape[0]
 
-        tau_squared = self.compute_bandwidths(data, kappa)
+        tau_squared = compute_centroid_scales(self.centroids, data, kappa)
         self.register_buffer("tau_squared", tau_squared)
-
-        # # w_k parameter
-        # self.register_buffer("w_", torch.ones(self.K) / self.K)
-        # self.w_ = nn.Parameter(self.w_, requires_grad=learn_weights)
-        # if learn_weights:
-        #     self.learn_w(data)
 
         # We do it this way so that w is then fixed.
         if learn_weights:
@@ -1817,137 +1919,6 @@ class LANDRBFCometric(CoMetric):
             The weights of the RBF kernels
         """
         return torch.nn.functional.softplus(self.w_)
-
-    def process_centroids(self, K: int) -> None:
-        """
-        Process the centroids to select K representative centroids using K-Medoids clustering.
-
-        Parameters:
-        K : int
-            The number of centroids to select. If K=-1, use all centroids.
-        """
-        dst_mat = torch.cdist(self.centroids, self.centroids, p=2).sqrt().cpu().numpy()
-        kmedoids_model = kmedoids.KMedoids(
-            n_clusters=K, metric="precomputed", random_state=1312
-        )
-        kmedoids_model.fit(dst_mat)
-        self.centroids = self.centroids[kmedoids_model.medoid_indices_]
-
-    def compute_bandwidths(
-        self,
-        data: Tensor,
-        kappa: Tensor,
-        min_cluster_size: int = 3,
-        neighbor_rank: int = 5,
-        min_scale_quantile: float = 0.25,
-        max_scale_quantile: float = 0.95,
-        eps: float = 1e-12,
-    ) -> Tensor:
-        """
-        Compute the (squared) bandwidths of the RBF kernels as:
-
-            tau_k^2 = kappa * scale_k^2
-
-        where scale_k^2 is an adaptive local-scale estimate for centroid c_k,
-        blended between two sources:
-
-        1. Local in-cluster scale (reliable when the cluster has enough points):
-            local_scale_k^2 = (1 / Card(C_k)) * sum_{x_i in C_k} ||c_k - x_i||^2
-        where C_k is the set of data points assigned to centroid c_k (i.e. c_k
-        is their nearest centroid).
-
-        2. Neighbor-based robust scale (used as a fallback when Card(C_k) is
-        small and the local estimate would be unreliable/pathological):
-            nn_scale_k^2 = ||c_k - c_(neighbor_rank)||^2
-        i.e. the squared distance from c_k to its `neighbor_rank`-th nearest
-        neighboring centroid (not the 1st, to avoid overly peaked kernels).
-        This is clamped between global quantiles of nn_scale^2 across all
-        centroids (min_scale_quantile, max_scale_quantile) so that outlier
-        centroids do not produce pathologically small or large bandwidths.
-
-        The two estimates are blended per-centroid via a reliability weight
-        r_k in [0, 1], based on the cluster cardinality relative to
-        min_cluster_size:
-
-            r_k     = clamp((Card(C_k) - 1) / (min_cluster_size - 1), 0, 1)
-            scale_k^2 = r_k * local_scale_k^2 + (1 - r_k) * nn_scale_k^2
-
-        The blended scale is then re-clamped to the same global [min, max]
-        bounds, and the final bandwidth is:
-
-            tau_k^2 = kappa * scale_k^2
-
-        Parameters:
-        -----------
-        data : Tensor (N, d)
-            The original data points, used to compute the clusters of centroids.
-        kappa : Tensor
-            The scaling factor applied to the blended scale to obtain tau^2.
-        min_cluster_size : int
-            Cluster cardinality at or above which the local in-cluster scale is
-            trusted fully (reliability = 1).
-        neighbor_rank : int
-            Which nearest-neighbor centroid (1-indexed, excluding self) to use
-            for the robust fallback scale.
-        min_scale_quantile, max_scale_quantile : float
-            Quantiles (over all centroids) used to clamp the neighbor-based
-            scale, preventing outlier centroids from dominating.
-        eps : float
-            Small constant to avoid division by zero / degenerate scales.
-
-        Returns:
-        --------
-        tau_squared : Tensor (K,)
-            The computed squared bandwidths for each centroid.
-        """
-        K = self.centroids.shape[0]
-
-        # Assign each sample to the closest centroid.
-        dst_data = torch.cdist(self.centroids, data, p=2)  # (K,N)
-        closest_centroid = dst_data.argmin(dim=0)  # (N,)
-
-        # Robust fallback scale from centroid geometry.
-        # Use a higher-order neighbor to avoid over-peaked kernels when K is large.
-        dst_centroids = torch.cdist(self.centroids, self.centroids, p=2)  # (K,K)
-        dst_centroids.fill_diagonal_(float("inf"))
-        sorted_dst, _ = torch.sort(dst_centroids, dim=1)
-        rank = min(max(neighbor_rank - 1, 0), max(K - 2, 0))  # (K,)
-        nn_dist = sorted_dst[:, rank]  # (K,)
-        nn_scale2 = nn_dist.pow(2).clamp_min(eps)
-
-        # Global robust floor/ceiling so outlier clusters do not dominate smoothness.
-        min_scale2 = torch.quantile(nn_scale2, min_scale_quantile).clamp_min(eps)
-        max_scale2 = torch.quantile(nn_scale2, max_scale_quantile).clamp_min(eps)
-
-        # Local in-cluster scale. May be unreliable when cluster cardinality is very small.
-        local_scale2 = torch.zeros(K, device=self.centroids.device, dtype=self.centroids.dtype)
-        counts = torch.bincount(closest_centroid, minlength=K).to(self.centroids.dtype)
-        for k in range(K):
-            cluster_points = data[closest_centroid == k]  # (Card(C_k),d)
-            if cluster_points.shape[0] > 0:
-                c_k = self.centroids[k : k + 1]
-                dist2 = torch.cdist(c_k, cluster_points, p=2).pow(2)
-                local_scale2[k] = dist2.mean().clamp_min(eps)
-
-        # Blend local scale with centroid-neighborhood scale.
-        # For small clusters (K ~ N), this prevents pathological very narrow kernels.
-        reliability = ((counts - 1) / max(min_cluster_size - 1, 1)).clamp(0.0, 1.0)
-        scale2 = reliability * local_scale2 + (1.0 - reliability) * nn_scale2
-        scale2 = scale2.clamp(min=min_scale2, max=max_scale2)
-
-        tau_squared = kappa * scale2
-
-        # Fix any potential numerical issues with the bandwidths
-        if not torch.isfinite(tau_squared).all():
-            finite_mask = torch.isfinite(tau_squared)
-            if finite_mask.any():
-                fill_value = tau_squared[finite_mask].median()
-            else:
-                fill_value = torch.tensor(
-                    1.0, device=tau_squared.device, dtype=tau_squared.dtype
-                )
-            tau_squared = torch.where(finite_mask, tau_squared, fill_value)
-        return tau_squared
 
     def learn_w(self, data: Tensor, n_iters: int = 400) -> None:
         """
@@ -1983,14 +1954,8 @@ class LANDRBFCometric(CoMetric):
             The computed h(x) values
         """
         dst = torch.cdist(x, self.centroids, p=2)  # (B,K)
-        # To avoid numerical issues when tau_squared is inf and dst is zero
-        # We set the corresponding rbf value to 1 in this case
-        # which means that the RBF kernel is constant and doesn't contribute to the metric
         rbf = dst**2 / (2 * self.tau_squared[None, :] + 1e-12)  # (B,K)
         rbf = torch.exp(-rbf)
-        # Set the RBF values to 1 where the tau_squared is infinite
-        rbf = torch.where(torch.isinf(self.tau_squared[None, :]), torch.ones_like(rbf), rbf)
-        # Keep mixture weights positive and normalized.
         h_x = torch.einsum("k,bk->b", w, rbf)  # (B,)
         return h_x
 
