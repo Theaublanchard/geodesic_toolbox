@@ -3616,6 +3616,7 @@ class SolverGraphGEORCEFinsler(GEORCEFinsler):
                 final_traj[b] = pts_on_traj_georce[b].detach().clone()
         return final_traj
 
+
 class GeodesicSpline(torch.nn.Module):
     """
     BSplined parameterization of a geodesic curve between two points q0 and q1.
@@ -3632,9 +3633,10 @@ class GeodesicSpline(torch.nn.Module):
         The degree of the B-spline.
     control_points : torch.Tensor (B, n_control_points, D), optional
         The control points for the B-spline. Must include q0 and q1 as the first and last control points, respectively.
-        If not None, will override the n_control_points parameter. 
+        If not None, will override the n_control_points parameter.
         If None, they will be initialized as a linear interpolation between q0 and q1.
     """
+
     def __init__(
         self,
         q0,
@@ -3655,12 +3657,8 @@ class GeodesicSpline(torch.nn.Module):
         self.n_control_points = n_control_points
 
         if control_points is None:
-            t = torch.linspace(0, 1, n_control_points,device=q0.device,dtype=q0.dtype)
-
-            control_points = (
-                q0[:, None, :]
-                + t[None, :, None] * (q1 - q0)[:, None, :]
-            )
+            t = torch.linspace(0, 1, n_control_points, device=q0.device, dtype=q0.dtype)
+            control_points = q0[:, None, :] + t[None, :, None] * (q1 - q0)[:, None, :]
 
         # Only optimize interior control points
         self.inner = torch.nn.Parameter(
@@ -3685,7 +3683,7 @@ class GeodesicSpline(torch.nn.Module):
 
     def forward(self, T):
         sample_points = torch.linspace(-1, 1, T, device=self.q0.device, dtype=self.q0.dtype)
-        spline_args = sample_points[:, None].expand(T,self.q0.shape[0])
+        spline_args = sample_points[:, None].expand(T, self.q0.shape[0])
         c_pts = self.control_points.to(self.q0.device)
 
         curve = tcf.bspline_curves(
@@ -3696,6 +3694,7 @@ class GeodesicSpline(torch.nn.Module):
         )
 
         return rearrange(curve, "t b d -> b t d")
+
 
 class GeodesicSolverSpline(GeodesicDistanceSolver):
     """
@@ -3717,13 +3716,16 @@ class GeodesicSolverSpline(GeodesicDistanceSolver):
     n_iter : int, optional
         The number of iterations for the optimizer. Default is 1000.
     """
-    def __init__(self, 
-                 cometric:CoMetric, 
-                 T:int=100, 
-                 n_control_points:int=20, 
-                 degree:int=3,lr=1e-2, 
-                 n_iter=1000,
-                 ):
+
+    def __init__(
+        self,
+        cometric: CoMetric,
+        T: int = 100,
+        n_control_points: int = 20,
+        degree: int = 3,
+        lr=1e-2,
+        n_iter=1000,
+    ):
         super().__init__()
         self.T = T
         self.cometric = cometric
@@ -3732,9 +3734,9 @@ class GeodesicSolverSpline(GeodesicDistanceSolver):
         self.lr = lr
         self.n_iter = n_iter
 
-        self.loss_list:list[float] = []
+        self.loss_list: list[float] = []
 
-    def optimize_spline(self, spline:GeodesicSpline)-> None:
+    def optimize_spline(self, spline: GeodesicSpline) -> None:
         """
         Optimizes the control points of the given spline to minimize the energy of the curve according to the cometric.
 
@@ -3746,7 +3748,7 @@ class GeodesicSolverSpline(GeodesicDistanceSolver):
         spline.train()
         loss_list = []
         optimizer = torch.optim.Adam(spline.parameters(), lr=self.lr)
-        pbar = tqdm(range(self.n_iter), desc="Optimizing spline")
+        pbar = tqdm(range(self.n_iter), desc="Optimizing spline", leave=False)
         for i in pbar:
             optimizer.zero_grad()
             curves_points = spline(self.T)
@@ -3757,7 +3759,7 @@ class GeodesicSolverSpline(GeodesicDistanceSolver):
             pbar.set_postfix({"loss": energy.sum().item()})
         self.loss_list = loss_list
 
-    def get_trajectories(self, q0, q1, init_control_points=None)-> torch.Tensor:
+    def get_trajectories(self, q0, q1, init_control_points=None) -> torch.Tensor:
         """
         Computes the geodesic trajectory between two points q0 and q1 using B-spline parameterization.
         If init_control_points is provided, it will be used as the initial control points for the spline optimization.
@@ -3777,13 +3779,14 @@ class GeodesicSolverSpline(GeodesicDistanceSolver):
         torch.Tensor (B, T, D)
             The computed geodesic trajectory between q0 and q1.
         """
-        geodesic_spline = GeodesicSpline(q0, q1, self.n_control_points, self.degree, control_points=init_control_points)
+        geodesic_spline = GeodesicSpline(
+            q0, q1, self.n_control_points, self.degree, control_points=init_control_points
+        )
         self.optimize_spline(geodesic_spline)
         curves_points = geodesic_spline(self.T)
         return curves_points
 
-
-    def forward(self, q0, q1,init_control_points=None):
+    def forward(self, q0, q1, init_control_points=None):
         """
         Computes the geodesic distance between two points q0 and q1 using B-spline parameterization.
         If init_control_points is provided, it will be used as the initial control points for the spline optimization.
@@ -3798,13 +3801,15 @@ class GeodesicSolverSpline(GeodesicDistanceSolver):
         init_control_points : torch.Tensor (B, n_control_points, D), optional
             The initial control points for the B-spline. Must include q0 and q1 as the first and last control points, respectively.
             If None, they will be initialized as a linear interpolation between q0 and q1.
-        
+
         Returns
         -------
         torch.Tensor (B,)
             The computed geodesic distance between q0 and q1.
         """
-        geodesic_spline = GeodesicSpline(q0, q1, self.n_control_points, self.degree, control_points=init_control_points)
+        geodesic_spline = GeodesicSpline(
+            q0, q1, self.n_control_points, self.degree, control_points=init_control_points
+        )
         self.optimize_spline(geodesic_spline)
         curves_points = geodesic_spline(self.T)
         dst = self.compute_distance(curves_points)
@@ -3817,11 +3822,28 @@ class GeodesicSolverSplineFinsler(GeodesicSolverSpline):
     The control points of the B-spline are optimized to minimize the energy of the curve according to the given Finsler metric.
     """
 
-    def __init__(self, finsler: FinslerMetric, T: int = 100, n_control_points: int = 20, degree: int = 3, lr=1e-2, n_iter=1000):
-        super().__init__(cometric=finsler, T=T, n_control_points=n_control_points, degree=degree, lr=lr, n_iter=n_iter)
+    def __init__(
+        self,
+        finsler: FinslerMetric,
+        T: int = 100,
+        n_control_points: int = 20,
+        degree: int = 3,
+        lr=1e-2,
+        n_iter=1000,
+    ):
+        super().__init__(
+            cometric=finsler,
+            T=T,
+            n_control_points=n_control_points,
+            degree=degree,
+            lr=lr,
+            n_iter=n_iter,
+        )
         self.finsler = finsler
 
-    def compute_energy(self, curves_points: torch.Tensor, use_midpoints: bool=True) -> torch.Tensor:
+    def compute_energy(
+        self, curves_points: torch.Tensor, use_midpoints: bool = True
+    ) -> torch.Tensor:
         """
         Computes the energy of the given curves according to the Finsler metric.
 
@@ -3842,11 +3864,13 @@ class GeodesicSolverSplineFinsler(GeodesicSolverSpline):
             pts = 0.5 * (curves_points[:, :-1, :] + curves_points[:, 1:, :])  # (B, T-1, D)
         else:
             pts = curves_points[:, :-1, :]  # (B, T-1, D)
-        energy = [self.finsler.forward(pts_,dx_).pow(2) for pts_,dx_ in zip(pts,dx)]
-        energy = torch.stack(energy,dim=0) # (B,T-1)
+        energy = [self.finsler.forward(pts_, dx_).pow(2) for pts_, dx_ in zip(pts, dx)]
+        energy = torch.stack(energy, dim=0)  # (B,T-1)
         return energy.sum(dim=1)  # (B,)
 
-    def compute_distance(self, curves_points: torch.Tensor, use_midpoints: bool=True) -> torch.Tensor:
+    def compute_distance(
+        self, curves_points: torch.Tensor, use_midpoints: bool = True
+    ) -> torch.Tensor:
         """
         Computes the geodesic distance of the given curves according to the Finsler metric.
 
@@ -3867,15 +3891,17 @@ class GeodesicSolverSplineFinsler(GeodesicSolverSpline):
             pts = 0.5 * (curves_points[:, :-1, :] + curves_points[:, 1:, :])  # (B, T-1, D)
         else:
             pts = curves_points[:, :-1, :]  # (B, T-1, D)
-        distance = [self.finsler.forward(pts_,dx_) for pts_,dx_ in zip(pts,dx)]
-        distance = torch.stack(distance,dim=0) # (B,T-1)
+        distance = [self.finsler.forward(pts_, dx_) for pts_, dx_ in zip(pts, dx)]
+        distance = torch.stack(distance, dim=0)  # (B,T-1)
         return distance.relu().sum(dim=1)  # (B,)
+
 
 class SolverGraphSpline(GeodesicDistanceSolver):
     """
     Chained solver. First the initial trajectory are computed using
     a graph based approach. Then they are refined using the Spline solver.
     """
+
     def __init__(
         self,
         cometric: CoMetric,
@@ -3883,8 +3909,9 @@ class SolverGraphSpline(GeodesicDistanceSolver):
         n_neighbors: int,
         batch_size: int = 64,
         T: int = 100,
-        n_control_points:int=20, 
-        degree:int=3,lr=1e-2, 
+        n_control_points: int = 20,
+        degree: int = 3,
+        lr=1e-2,
         n_iter=1000,
         max_data_count: None | int = None,
         smooth_curve: bool = True,
@@ -3924,7 +3951,9 @@ class SolverGraphSpline(GeodesicDistanceSolver):
             The geodesic trajectories between q0 and q1 (both included).
         """
         pts_on_traj_graph = self.graph_solver.get_trajectories(q0, q1, connect_euclidean=True)
-        pts_on_traj_spline = self.spline_solver.get_trajectories(q0,q1,init_control_points=pts_on_traj_graph)
+        pts_on_traj_spline = self.spline_solver.get_trajectories(
+            q0, q1, init_control_points=pts_on_traj_graph
+        )
 
         final_traj = torch.zeros_like(pts_on_traj_spline)
         # Return the trajectory with the smallest distance
@@ -3938,12 +3967,14 @@ class SolverGraphSpline(GeodesicDistanceSolver):
             else:
                 final_traj[b] = pts_on_traj_spline[b]
         return final_traj
-    
+
+
 class SolverGraphSplineFinsler(torch.nn.Module):
     """
     Chained solver. First the initial trajectory are computed using
     a graph based approach. Then they are refined using the Spline solver.
     """
+
     def __init__(
         self,
         finsler: FinslerMetric,
@@ -3951,8 +3982,9 @@ class SolverGraphSplineFinsler(torch.nn.Module):
         n_neighbors: int,
         batch_size: int = 64,
         T: int = 100,
-        n_control_points:int=20, 
-        degree:int=3,lr=1e-2, 
+        n_control_points: int = 20,
+        degree: int = 3,
+        lr=1e-2,
         n_iter=1000,
         max_data_count: None | int = None,
         smooth_curve: bool = True,
@@ -3977,7 +4009,9 @@ class SolverGraphSplineFinsler(torch.nn.Module):
         )
         self.finsler = finsler
 
-    def compute_distance(self, curves_points: torch.Tensor, use_midpoints: bool=True) -> torch.Tensor:
+    def compute_distance(
+        self, curves_points: torch.Tensor, use_midpoints: bool = True
+    ) -> torch.Tensor:
         """
         Computes the geodesic distance of the given curves according to the Finsler metric.
 
@@ -3999,11 +4033,11 @@ class SolverGraphSplineFinsler(torch.nn.Module):
         else:
             pts = curves_points[:, :-1, :]  # (B, T-1, D)
         # distance = self.finsler.forward(pts, dx).relu().sum(dim=1)  # (B,)
-        distance = [self.finsler.forward(pts_,dx_) for pts_,dx_ in zip(pts,dx)]
-        distance = torch.stack(distance,dim=0) # (B,T-1)
+        distance = [self.finsler.forward(pts_, dx_) for pts_, dx_ in zip(pts, dx)]
+        distance = torch.stack(distance, dim=0)  # (B,T-1)
         distance = distance.relu().sum(dim=1)  # (B,)
         return distance
-    
+
     def get_trajectories(self, q0: Tensor, q1: Tensor) -> Tensor:
         """Given the start and end points, compute the geodesic path between the two.
 
@@ -4020,7 +4054,9 @@ class SolverGraphSplineFinsler(torch.nn.Module):
             The geodesic trajectories between q0 and q1 (both included).
         """
         pts_on_traj_graph = self.graph_solver.get_trajectories(q0, q1, connect_euclidean=True)
-        pts_on_traj_spline = self.spline_solver.get_trajectories(q0,q1,init_control_points=pts_on_traj_graph)
+        pts_on_traj_spline = self.spline_solver.get_trajectories(
+            q0, q1, init_control_points=pts_on_traj_graph
+        )
 
         final_traj = torch.zeros_like(pts_on_traj_spline)
         # Return the trajectory with the smallest distance
@@ -4034,7 +4070,8 @@ class SolverGraphSplineFinsler(torch.nn.Module):
             else:
                 final_traj[b] = pts_on_traj_spline[b]
         return final_traj
-    
+
+
 class ExpMapRanders(torch.nn.Module):
     """
     Shoot a geodesic trajectory on a Randers metric using the shooting method.

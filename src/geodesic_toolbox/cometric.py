@@ -895,7 +895,9 @@ class PBIG_Cometric_Gaussian(CoMetric):
         self.epsilon = epsilon
         self.rho = rho
 
-    def kl(self, normal_0 : torch.distributions.Normal, normal_1 : torch.distributions.Normal) -> torch.Tensor:
+    def kl(
+        self, normal_0: torch.distributions.Normal, normal_1: torch.distributions.Normal
+    ) -> torch.Tensor:
         """Compute the KL divergence between two multivariate normal distributions.
 
         Parameters:
@@ -919,7 +921,7 @@ class PBIG_Cometric_Gaussian(CoMetric):
         """
         Computes u^T G(q) v for a batch of points q at tangent vectors u and v.
         Here we use the polarization identity to avoid to compute the metric tensor explicitly.
-        Ie : 
+        Ie :
         u^T G(q) v = 1/4 * ( (u+v)^T G(q) (u+v) - (u-v)^T G(q) (u-v) )
 
         Parameters:
@@ -987,7 +989,7 @@ class PBIG_Cometric_Gaussian(CoMetric):
         res : Tensor (b,) sqrt(p^TG(q)p)
         """
         return self.energy(z, p).sqrt()
-    
+
     def metric_tensor(self, z: torch.Tensor) -> torch.Tensor:
         """Compute the metric tensor at a given point in the latent space.
 
@@ -1013,11 +1015,7 @@ class PBIG_Cometric_Gaussian(CoMetric):
             x_hat_plus, logvar_plus = self.decoder(z_plus)
             normal_plus = torch.distributions.Normal(x_hat_plus, torch.exp(0.5 * logvar_plus))
 
-            g[:, i, i] = (
-                2
-                * self.kl(normal_base, normal_plus)
-                / (self.epsilon**2)
-            )
+            g[:, i, i] = 2 * self.kl(normal_base, normal_plus) / (self.epsilon**2)
 
         # Fill the off-diagonal
         for i in range(latent_dim):
@@ -1037,8 +1035,7 @@ class PBIG_Cometric_Gaussian(CoMetric):
                 )
 
                 g[:, i, j] = (
-                    self.kl(normal_base, normal_plus_i)
-                    - self.kl(normal_base, normal_plus_j)
+                    self.kl(normal_base, normal_plus_i) - self.kl(normal_base, normal_plus_j)
                 ) / (self.epsilon**2)
 
                 g[:, j, i] = g[:, i, j]
@@ -1108,7 +1105,7 @@ class PBIG_Cometric(CoMetric):
         """
         Computes u^T G(q) v for a batch of points q at tangent vectors u and v.
         Here we use the polarization identity to avoid to compute the metric tensor explicitly.
-        Ie : 
+        Ie :
         u^T G(q) v = 1/4 * ( (u+v)^T G(q) (u+v) - (u-v)^T G(q) (u-v) )
 
         Parameters:
@@ -1911,17 +1908,16 @@ class LANDRBFCometric(CoMetric):
 
         # Robust fallback scale from centroid geometry.
         # Use a higher-order neighbor to avoid over-peaked kernels when K is large.
-        dst_centroids = torch.cdist(self.centroids, self.centroids, p=2)
+        dst_centroids = torch.cdist(self.centroids, self.centroids, p=2)  # (K,K)
         dst_centroids.fill_diagonal_(float("inf"))
         sorted_dst, _ = torch.sort(dst_centroids, dim=1)
-        rank = min(max(neighbor_rank - 1, 0), max(K - 2, 0))
+        rank = min(max(neighbor_rank - 1, 0), max(K - 2, 0))  # (K,)
         nn_dist = sorted_dst[:, rank]  # (K,)
         nn_scale2 = nn_dist.pow(2).clamp_min(eps)
 
         # Global robust floor/ceiling so outlier clusters do not dominate smoothness.
         min_scale2 = torch.quantile(nn_scale2, min_scale_quantile).clamp_min(eps)
         max_scale2 = torch.quantile(nn_scale2, max_scale_quantile).clamp_min(eps)
-        nn_scale2 = nn_scale2.clamp(min=min_scale2, max=max_scale2)
 
         # Local in-cluster scale. May be unreliable when cluster cardinality is very small.
         local_scale2 = torch.zeros(K, device=self.centroids.device, dtype=self.centroids.dtype)
