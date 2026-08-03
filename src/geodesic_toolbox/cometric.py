@@ -690,7 +690,7 @@ class PullBackCometric(CoMetric):
         diffeo: torch.nn.Module,
         base_cometric: CoMetric = IdentityCoMetric(is_diag=False),
         method: str = "finite_difference",
-        reg_coef: float = 1e-5,
+        reg_coef: float = 1e-3,
         chunk_size: int = 4,
         eps: float = 1e-4,
     ):
@@ -1648,7 +1648,7 @@ class LANDCometric(CoMetric):
         centroids: Tensor,
         alpha: int = 1,
         sigma: float = None,
-        reg_coef: float = 1e-5,
+        reg_coef: float = 1e-3,
         K: int = None,
     ):
         super().__init__(is_diag=True)
@@ -1756,7 +1756,7 @@ class LANDRBFCometric(CoMetric):
         If None, uses all centroids.
     kappa : float. Default to 1.0.
         The scaling factor for the bandwidths of the RBF kernels.
-    reg_coef : float. Default to 1e-3.
+    reg_coef : float. Default to 1e-5.
         The regularization coefficient.
     learn_weights : bool. Default to False.
         Whether to learn the weights w_k of the RBF kernels. If False, they are fixed to 1/K.
