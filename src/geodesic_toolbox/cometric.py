@@ -856,15 +856,20 @@ class PullBackCometric(CoMetric):
         g = self.metric_tensor(q)
         return torch.linalg.inv(g)
 
-    def dot(self, q: Tensor, u: Tensor, v: Tensor) -> Tensor:
-        flat_forward = lambda x: self.diffeo(x).flatten(start_dim=1)
-        Jqu = torch.func.jvp(flat_forward, (q,), (u,))[1]
-        Jqv = torch.func.jvp(flat_forward, (q,), (v,))[1]
-        if not isinstance(self.base_cometric, IdentityCoMetric):
-            g_base = self.base_cometric.metric_tensor(self.diffeo(q))
-            return torch.einsum("bi,bij,bj->b", Jqu, g_base, Jqv)
-        else:
-            return torch.sum(Jqu * Jqv, dim=1)
+    # This version, albeit much faster and elegant still uses 
+    # way too much memory for high-dimensional outputs.
+    # So we resort to instantiating the metric tensor and computing
+    # the regular dot product. This is not optimal but it works for now.
+    # def dot(self, q: Tensor, u: Tensor, v: Tensor) -> Tensor:
+    #     flat_forward = lambda x: self.diffeo(x).flatten(start_dim=1)
+    #     # If crash here because of forward AD : GLHF
+    #     Jqu = torch.func.jvp(flat_forward, (q,), (u,))[1]
+    #     Jqv = torch.func.jvp(flat_forward, (q,), (v,))[1]
+    #     if not isinstance(self.base_cometric, IdentityCoMetric):
+    #         g_base = self.base_cometric.metric_tensor(self.diffeo(q))
+    #         return torch.einsum("bi,bij,bj->b", Jqu, g_base, Jqv)
+    #     else:
+    #         return torch.sum(Jqu * Jqv, dim=1)
 
     def extra_repr(self) -> str:
         return f"method={self.method}, reg_coef={self.reg_coef}"
