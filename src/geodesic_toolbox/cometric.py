@@ -836,7 +836,12 @@ class PullBackCometric(CoMetric):
         flatten_diffeo = lambda x: self.diffeo(x).flatten(start_dim=1)
         eye = torch.eye(d, device=z.device, dtype=z.dtype)
         cols = []
-        for j in range(d):
+        pbar = tqdm(
+            range(d),
+            desc="Computing pullback metric via forward mode autodiff",
+            leave=False,
+        )
+        for j in pbar:
             v = eye[j].unsqueeze(0).expand(B, -1)
             _, Jv = torch.func.jvp(flatten_diffeo, (z,), (v,))
             cols.append(Jv)
@@ -856,7 +861,7 @@ class PullBackCometric(CoMetric):
         g = self.metric_tensor(q)
         return torch.linalg.inv(g)
 
-    # This version, albeit much faster and elegant still uses 
+    # This version, albeit much faster and elegant still uses
     # way too much memory for high-dimensional outputs.
     # So we resort to instantiating the metric tensor and computing
     # the regular dot product. This is not optimal but it works for now.
@@ -1048,7 +1053,9 @@ class PBIG_Cometric_Gaussian(CoMetric):
                 )
 
                 g[:, i, j] = (
-                    self.kl(normal_base, normal_plus_ij) - self.kl(normal_base, normal_plus_i) - self.kl(normal_base, normal_plus_j)
+                    self.kl(normal_base, normal_plus_ij)
+                    - self.kl(normal_base, normal_plus_i)
+                    - self.kl(normal_base, normal_plus_j)
                 ) / (self.epsilon**2)
 
                 g[:, j, i] = g[:, i, j]
@@ -1892,7 +1899,7 @@ class LANDRBFCometric(CoMetric):
     def __init__(
         self,
         data: Tensor,
-        K: int,
+        K: int = None,
         kappa: float = 1.0,
         reg_coef: float = 1e-3,
         learn_weights: bool = False,
