@@ -927,6 +927,40 @@ class PBIG_Cometric_Gaussian(CoMetric):
         kl = kl.sum(dim=tuple(range(1, len(dims) + 1)))  # Sum over all dimensions except batch
         return kl
 
+    def kl_(
+        self,
+        mu_0: torch.Tensor,
+        logvar_0: torch.Tensor,
+        mu_1: torch.Tensor,
+        logvar_1: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the KL divergence between two multivariate normal distributions given their means and log-variances.
+
+        Parameters:
+        ----------
+        mu_0 : torch.Tensor (B, d)
+            The mean of the first normal distribution.
+        logvar_0 : torch.Tensor (B, d)
+            The log-variance of the first normal distribution, assumed diagonal.
+        mu_1 : torch.Tensor (B, d)
+            The mean of the second normal distribution.
+        logvar_1 : torch.Tensor (B, d)
+            The log-variance of the second normal distribution, assumed diagonal.
+
+        Returns:
+        -------
+        kl_div : torch.Tensor (B,)
+            The KL divergence between the two distributions.
+        """
+        kl = 0.5 * (
+            logvar_1
+            - logvar_0
+            + (torch.exp(logvar_0) + (mu_0 - mu_1) ** 2) / torch.exp(logvar_1)
+            - 1
+        )
+        kl = kl.sum(dim=1)  # Sum over all dimensions except batch
+        return kl
+
     def dot(self, z: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
         Computes u^T G(q) v for a batch of points q at tangent vectors u and v.
@@ -951,9 +985,18 @@ class PBIG_Cometric_Gaussian(CoMetric):
         uv_plus = u + v
         uv_minus = u - v
 
-        fst = self.energy(z, uv_plus)
-        snd = self.energy(z, uv_minus)
+        mu_base, logvar_base = self.decoder(z)
+        mu_plus, logvar_plus = self.decoder(z + uv_plus)
+        mu_minus, logvar_minus = self.decoder(z + uv_minus)
+
+        normal_base = torch.distributions.Normal(mu_base, torch.exp(0.5 * logvar_base))
+        normal_plus = torch.distributions.Normal(mu_plus, torch.exp(0.5 * logvar_plus))
+        normal_minus = torch.distributions.Normal(mu_minus, torch.exp(0.5 * logvar_minus))
+
+        fst = self.kl(normal_base, normal_plus)
+        snd = self.kl(normal_base, normal_minus)
         dot_ = 0.25 * (fst - snd)
+
         return dot_
 
     def energy(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
