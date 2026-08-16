@@ -1306,16 +1306,16 @@ class Hamiltonian(torch.nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, z: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, p: Tensor) -> Tensor:
         """
-        Compute the Hamiltonian H(z,v)
+        Compute the Hamiltonian H(q,p)
 
         Parameters
         ----------
-        z : Tensor (b,d)
+        q : Tensor (b,d)
             The position.
-        v : Tensor (b,d)
-            The velocity.
+        p : Tensor (b,d)
+            The momentum.
 
         Returns
         -------
@@ -1324,6 +1324,42 @@ class Hamiltonian(torch.nn.Module):
         raise NotImplementedError(
             "The Hamiltonian function must be implemented by inheriting this class."
         )
+
+    def dH_dq(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Compute the gradient of the Hamiltonian with respect to the position.
+
+        Parameters
+        ----------
+        q : Tensor (b,d)
+            The position.
+        p : Tensor (b,d)
+            The momentum.
+
+        Returns
+        -------
+        Tensor (b,d)
+            The gradient of the Hamiltonian with respect to the position.
+        """
+        return torch.func.grad(lambda q: self.forward(q, p).sum(), argnums=0)(q)
+
+    def dH_dp(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Compute the gradient of the Hamiltonian with respect to the momentum.
+
+        Parameters
+        ----------
+        q : Tensor (b,d)
+            The position.
+        p : Tensor (b,d)
+            The momentum.
+
+        Returns
+        -------
+        Tensor (b,d)
+            The gradient of the Hamiltonian with respect to the momentum.
+        """
+        return torch.func.grad(lambda p: self.forward(q, p).sum(), argnums=0)(p)
 
 
 class EulerIntegrator(torch.nn.Module):
@@ -1344,13 +1380,6 @@ class EulerIntegrator(torch.nn.Module):
         self.substeps = substeps
         self.gamma = gamma / self.substeps
 
-        # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
-        no_batch_H = lambda q, p: self.H(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
-        self._dH_dq = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
-        self._dH_dp = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
-        self.dH_dq = lambda p, q: self._dH_dq(q, p)
-        self.dH_dp = lambda p, q: self._dH_dp(q, p)
-
     def euler_step(self, q: Tensor, p: Tensor) -> tuple[Tensor, Tensor]:
         """
         Perform a single Euler step.
@@ -1369,8 +1398,8 @@ class EulerIntegrator(torch.nn.Module):
         p_new : Tensor (b,d)
             The new momentum.
         """
-        dz_dt = self.dH_dp(q, p)
-        dp_dt = -self.dH_dq(q, p)
+        dz_dt = self.H.dH_dp(q, p)
+        dp_dt = -self.H.dH_dq(q, p)
         q_new = q + self.gamma * dz_dt
         p_new = p + self.gamma * dp_dt
         return q_new, p_new
@@ -1459,13 +1488,6 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
         self.substeps = substeps
         self.gamma = gamma / self.substeps
 
-        # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
-        no_batch_H = lambda q, p: self.H(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
-        self._dH_dq = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
-        self._dH_dp = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
-        self.dH_dq = lambda q, p: self._dH_dq(q, p)
-        self.dH_dp = lambda q, p: self._dH_dp(q, p)
-
     def get_p_half(self, q_0: Tensor, p_0: Tensor) -> Tensor:
         """
         Solves the fixed point equation for the momentum:
@@ -1485,7 +1507,7 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
         """
         p_half = p_0.clone()
         for k in range(self.n_fix_pts):
-            p_half_ = p_0 - self.gamma * self.dH_dq(q_0, p_half) / 2
+            p_half_ = p_0 - self.gamma * self.H.dH_dq(q_0, p_half) / 2
             # if (p_half_ - p_half).abs().max() < 1e-6:
             #     p_half = p_half_
             #     break
@@ -1512,7 +1534,8 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
         q_new = q_0.clone()
         for k in range(self.n_fix_pts):
             q_new_ = (
-                q_0 + self.gamma * (self.dH_dp(q_0, p_half) + self.dH_dp(q_new, p_half)) / 2
+                q_0
+                + self.gamma * (self.H.dH_dp(q_0, p_half) + self.H.dH_dp(q_new, p_half)) / 2
             )
             # if (q_new_ - q_new).abs().max() < 1e-6:
             #     q_new = q_new_
@@ -1543,7 +1566,7 @@ class ImplicitLeapfrogIntegrator(torch.nn.Module):
         for _ in range(self.substeps):
             p_half = self.get_p_half(q_1, p_1)
             q_1 = self.get_q_new(q_1, p_half)
-            p_1 = p_half - self.gamma * self.dH_dq(q_1, p_half) / 2
+            p_1 = p_half - self.gamma * self.H.dH_dq(q_1, p_half) / 2
         return q_1, p_1
 
     def forward(
@@ -1625,13 +1648,6 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         s = torch.Tensor([2 * self.omega * self.gamma]).sin()
         self.register_buffer("c", c, persistent=False)
         self.register_buffer("s", s, persistent=False)
-
-        # Compute per-sample gradients to avoid materializing a full (B, B, D) Jacobian.
-        no_batch_H = lambda q, p: self.H_base(q.unsqueeze(0), p.unsqueeze(0)).squeeze(0)
-        self._dH_dq = torch.vmap(torch.func.jacrev(no_batch_H, argnums=0))
-        self._dH_dp = torch.vmap(torch.func.jacrev(no_batch_H, argnums=1))
-        self.dH_dq = lambda q, p: self._dH_dq(q, p)
-        self.dH_dp = lambda q, p: self._dH_dp(q, p)
 
     def binding(self, q_0: Tensor, p_0: Tensor, q_1: Tensor, p_1: Tensor) -> Tensor:
         """
@@ -1715,10 +1731,10 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         c = self.c.to(q_0.device).to(q_0.dtype)
         s = self.s.to(q_0.device).to(q_0.dtype)
 
-        p_0_new = p_0 - self.gamma / 2 * self.dH_dq(q_0, p_1)
-        q_1_new = q_1 + self.gamma / 2 * self.dH_dp(q_0, p_1)
-        p_1_new = p_1 - self.gamma / 2 * self.dH_dq(q_1_new, p_0)
-        q_0_new = q_0 + self.gamma / 2 * self.dH_dp(q_1_new, p_0)
+        p_0_new = p_0 - self.gamma / 2 * self.H_base.dH_dq(q_0, p_1)
+        q_1_new = q_1 + self.gamma / 2 * self.H_base.dH_dp(q_0, p_1)
+        p_1_new = p_1 - self.gamma / 2 * self.H_base.dH_dq(q_1_new, p_0)
+        q_0_new = q_0 + self.gamma / 2 * self.H_base.dH_dp(q_1_new, p_0)
 
         # Apply the binding map simultaneously from the same pre-rotation state.
         q0_pre, p0_pre = q_0_new, p_0_new
@@ -1729,10 +1745,10 @@ class ExplicitLeapfrogIntegrator(torch.nn.Module):
         q_1_new = (q0_pre + q1_pre - c * (q0_pre - q1_pre) - s * (p0_pre - p1_pre)) / 2
         p_1_new = (p0_pre + p1_pre + s * (q0_pre - q1_pre) - c * (p0_pre - p1_pre)) / 2
 
-        p_1_new = p_1_new - self.gamma / 2 * self.dH_dq(q_1_new, p_0_new)
-        q_0_new = q_0_new + self.gamma / 2 * self.dH_dp(q_1_new, p_0_new)
-        p_0_new = p_0_new - self.gamma / 2 * self.dH_dq(q_0_new, p_1_new)
-        q_1_new = q_1_new + self.gamma / 2 * self.dH_dp(q_0_new, p_1_new)
+        p_1_new = p_1_new - self.gamma / 2 * self.H_base.dH_dq(q_1_new, p_0_new)
+        q_0_new = q_0_new + self.gamma / 2 * self.H_base.dH_dp(q_1_new, p_0_new)
+        p_0_new = p_0_new - self.gamma / 2 * self.H_base.dH_dq(q_0_new, p_1_new)
+        q_1_new = q_1_new + self.gamma / 2 * self.H_base.dH_dp(q_0_new, p_1_new)
 
         return q_0_new, p_0_new, q_1_new, p_1_new
 
