@@ -3558,7 +3558,7 @@ class SolverGraphGEORCEFinsler(GEORCEFinsler):
         n_neighbors: int,
         batch_size: int = 64,
         T: int = 100,
-        max_iter=20,  # low value bc good initialization from graph
+        max_iter=30,  # low value bc good initialization from graph
         tol=1e-10,
         rho=0.5,
         c=0.9,

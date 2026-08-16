@@ -484,6 +484,7 @@ def sample_cone(
     return v
 
 
+@torch.no_grad()
 def sample_cone_VMF(
     x_0: Tensor, randers: RandersMetrics, kappa: float, alpha: float = 1.0
 ) -> Tensor:
