@@ -1,26 +1,25 @@
-[build-system]
-requires = ["setuptools", "setuptools-scm", "wheel"] 
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "geodesic_toolbox"
-version = "0.0.1"
-authors = [
-  { name="Théau Blanchard", email="theau.blanchard@gehealthcare.com" },
-]
+name = "geodesic-toolbox"
+version = "0.1.0"
 description = "This package allows to compute geodesic distances/trajectories between points on a Riemannian manifold. The metric is defined by the user and can be parametrized by a neural network. It also support sampling as well as Randers metrics."
 readme = "README.md"
-requires-python = ">=3.11.9"
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
+authors = [
+    { name = "Theau Blanchard", email = "theau.blanchard@inria.fr" }
 ]
+requires-python = ">=3.13"
 dependencies = [
-    "torch>=2.0.0",
-    "numpy<2",
-    "scikit-learn>=1.6.0",
-    "tqdm>=4.65.0",    
-    "einops>=0.8.0",
-    "scipy>=1.15.0",
+    "einops>=0.8.2",
+    "kmedoids>=0.5.5",
+    "networkx>=3.6.1",
+    "numpy>=2.5.2",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.1",
+    "torch>=2.13.0",
+    "torchcurves>=0.3.1",
+    "torchdiffeq>=0.2.5",
+    "tqdm>=4.70.0",
 ]
-    
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
