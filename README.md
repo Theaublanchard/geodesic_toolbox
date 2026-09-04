@@ -1,6 +1,7 @@
 # Geodesic Toolbox: Riemannian metric and Finsler metric learning in PyTorch
 
 <!-- [![PyPI version](https://img.shields.io/pypi/v/geodesic_toolbox.svg)](https://pypi.org/project/geodesic_toolbox/) -->
+
 [![Python 3.11+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CC BY-NC-ND 4.0](https://img.shields.io/badge/License-CC_BY--NC--ND_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-nd/4.0/)(LICENSE)
 
@@ -24,20 +25,10 @@ The library is centered around the modeling of metrics via their cometric tensor
 
 ## Installation
 
-### Requirements
-
-- Python ≥ 3.11
-- PyTorch ≥ 2.0.0
-- NumPy < 2.0
-- SciPy ≥ 1.15.0
-- scikit-learn ≥ 1.6.0
-
-### From Source
+We recommend using uv to install the project. Run the following command in your terminal:
 
 ```bash
-git clone https://github.com/[username]/geodesic_toolbox.git
-cd geodesic_toolbox
-pip install -e .
+uv add git+https://github.com/Theaublanchard/geodesic_toolbox
 ```
 
 ## Quick Start
@@ -99,7 +90,7 @@ class MyDiffeomorphism(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 3)  # Output dimension
         )
-    
+  
     def forward(self, x):
         return self.net(x)
 
@@ -141,7 +132,7 @@ solver = SolverGraph(
 distance = solver(q0, q1)
 ```
 
-**Advantages**: Very fast, handles non-convex regions  
+**Advantages**: Very fast, handles non-convex regions
 **Disadvantages**: Requires training data, approximate distances
 
 ### 4. **GEORCE Solver**
@@ -162,7 +153,7 @@ solver = GEORCE(
 distance = solver(q0, q1)
 ```
 
-**Advantages**: Highly accurate  
+**Advantages**: Highly accurate
 **Disadvantages**: Slower, requires careful tuning or good initialisation
 
 ### 3. **Hybrid Solver (Graph-Based + GEORCE)**
@@ -183,7 +174,7 @@ solver = SolverGraphGEORCE(
 distance = solver(q0, q1)
 ```
 
-**Advantages**: Balances speed and accuracy  
+**Advantages**: Balances speed and accuracy
 **Disadvantages**: Requires to have training data. Longer runtime than pure graph-based solver.
 
 ## 4. **Shooting Solver** (not recommended for complex metrics)
@@ -233,23 +224,23 @@ distance = solver(q0, q1)
 
 ### Riemannian Metrics
 
-| Metric | Class | Use Case |
-| -------- | ------- | ---------- |
-| Euclidean | `IdentityCoMetric` | Baseline |
-| Poincaré Ball | `PointCarreCoMetric` | Hyperbolic geometry |
-| Pullback Metric | `PullBackCometric` | Neural network-defined metrics |
-| Fisher-Rao | `FisherRaoCometric` | Information geometry |
-| Lifted Metric | `LiftedCometric` | Level set constraints |
-| Interpolated | `CentroidsCometric` | Data-driven metrics |
-| Parametric | `DiagonalCometricModel` ... | Learnable metrics |
+| Metric          | Class                         | Use Case                       |
+| --------------- | ----------------------------- | ------------------------------ |
+| Euclidean       | `IdentityCoMetric`          | Baseline                       |
+| Poincaré Ball  | `PointCarreCoMetric`        | Hyperbolic geometry            |
+| Pullback Metric | `PullBackCometric`          | Neural network-defined metrics |
+| Fisher-Rao      | `FisherRaoCometric`         | Information geometry           |
+| Lifted Metric   | `LiftedCometric`            | Level set constraints          |
+| Interpolated    | `CentroidsCometric`         | Data-driven metrics            |
+| Parametric      | `DiagonalCometricModel` ... | Learnable metrics              |
 
 ### Finsler Metrics
 
-| Metric | Class | Use Case |
-| -------- | ------- | ---------- |
-| Randers | `RandersMetrics` | Directional-dependent geometry |
-| Matsumoto | `MatsumotoMetrics` | Alternative Finsler metric |
-| Slope | `SlopeMetrics` | Terrain-based metrics |
+| Metric    | Class                | Use Case                       |
+| --------- | -------------------- | ------------------------------ |
+| Randers   | `RandersMetrics`   | Directional-dependent geometry |
+| Matsumoto | `MatsumotoMetrics` | Alternative Finsler metric     |
+| Slope     | `SlopeMetrics`     | Terrain-based metrics          |
 
 ### Metric Composition
 
@@ -290,10 +281,10 @@ solver = ShootingSolver(cometric=metric, n_step=50)
 for epoch in range(100):
     q0 = torch.randn(32, 2, requires_grad=True)
     q1 = torch.randn(32, 2, requires_grad=True)
-    
+  
     distances = solver(q0, q1)
     loss = distances.mean()
-    
+  
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
