@@ -25,10 +25,25 @@ The library is centered around the modeling of metrics via their cometric tensor
 
 ## Installation
 
-We recommend using uv to install the project. Run the following command in your terminal:
+We recommend using uv to install the project. To add the library as a dependency, run:
 
 ```bash
 uv add git+https://github.com/Theaublanchard/geodesic_toolbox
+```
+
+To install the library in development mode, clone the repository and run:
+
+```bash
+git clone https://github.com/Theaublanchard/geodesic_toolbox.git
+cd geodesic_toolbox
+uv sync
+```
+
+And if you need it in another project, as editable, add the following to your library's `pyproject.toml`:
+
+```toml
+[tool.uv.sources]
+geodesic-toolbox = { path = "geodesic_toolbox", editable = true }
 ```
 
 ## Quick Start
