@@ -2658,3 +2658,42 @@ class DualRandersMetrics(RandersMetrics):
         F_star = v_norm + omega_star_v  # (b,)
         reg_F_star = torch.sqrt(F_star**2 + self.epsilon**2)  # (b,)
         return reg_F_star
+
+
+class BinetLegendreRanders(CoMetric):
+    """
+    Binet-Legendre cometric associated with a Randers metric.
+
+    Parameters:
+    -----------
+    randers : RandersMetrics
+        The Randers metric for which to compute the Binet-Legendre cometric.
+    """
+
+    def __init__(self, randers: RandersMetrics):
+        super().__init__()
+        self.randers = randers
+
+    def cometric_tensor(self, x: Tensor) -> Tensor:
+        base_cometric = self.randers.base_cometric.cometric_tensor(x)
+        if self.randers.base_cometric.is_diag:
+            base_cometric = torch.diag_embed(base_cometric)
+
+        omega = self.randers.beta * self.randers.omega(x)
+        beta_norm_squared = self.randers.base_cometric.dual_energy(x, omega)
+        radius_squared = 1 / (1 - beta_norm_squared)
+
+        omega_sharp = torch.einsum("bij,bj->bi", base_cometric, omega)
+        omega_sharp_outer = torch.einsum(
+            "bi,bj->bij", omega_sharp, omega_sharp
+        )
+        c_sharp = radius_squared[:, None] * omega_sharp
+        c_sharp_outer = torch.einsum("bi,bj->bij", c_sharp, c_sharp)
+
+        m = base_cometric.shape[-1]
+        C_inv = base_cometric + radius_squared[:, None, None] * omega_sharp_outer 
+        g_inv = radius_squared[:, None, None] * C_inv + (m+2) * c_sharp_outer
+        return g_inv
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.cometric_tensor(x)
