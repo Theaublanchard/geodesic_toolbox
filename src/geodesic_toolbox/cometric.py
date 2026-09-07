@@ -691,7 +691,7 @@ class PullBackCometric(CoMetric):
         base_cometric: CoMetric = IdentityCoMetric(is_diag=False),
         method: str = "finite_difference",
         reg_coef: float = 1e-3,
-        chunk_size: int = 4,
+        chunk_size: int = 16,
         eps: float = 1e-4,
     ):
         super().__init__()
@@ -881,246 +881,59 @@ class PullBackCometric(CoMetric):
 
 
 class PBIG_Cometric_Gaussian(CoMetric):
-    """Description of the Pullback information geometry metric.
-    Here we only focus on the case where the decoder distributions are gaussians.
+    """
+    Description of the Pullback information geometry metric.
+    Here we only focus on the case where the decoder distributions are gaussians N(mu, sigma).
+    Consequently, we know the exact expression of the Fisher-Rao metric and we can compute it without any approximation.
+    This allows to then compute the actual pullback J^T G_{Fisher-Rao} J metric tensor.
+    This approach is less memory intensive than the one using the KL divergence to compute the metric tensor.
 
-    Paper : Arvanitidis, Georgios, et al. "Pulling back information geometry." 25th International Conference on Artificial Intelligence and Statistics. 2022.
-
+    Here G_{Fisher-Rao} = diag(1/sigma^2, 2/sigma^2) where sigma is the standard deviation of the decoder distribution.
+    So the metric is given by:
+    G = J_mu^T diag(1/sigma^2) J_mu + J_std^T diag(2/sigma^2) J_std + reg_coef * I
 
     Parameters:
     ----------
     decoder : torch.nn.Module
-        The stochastic decoder of a VAE model. Its signature should be `decoder(z: torch.Tensor) -> (x_hat: torch.Tensor, logvar: torch.Tensor)`,
-        where `x_hat` is the mean of the decoder distribution and `logvar` is the log-variance ; both of shape `(batch_size, ...)`,
-        where `...` is the shape of the data space, typically `(batch_size, C, H, W)` for images.
-    epsilon: float
-        The small constant added to each vector basis in the latent space.
-    rho : float
-        The small constant added to the diagonal of the covariance matrix of the decoder distribution.
+        The stochastic decoder of a VAE model. It should have two branches:
+        - decoder.mu_branch Tensor[b, d] -> Tensor[b, ...] 
+            It should return the mean of the decoder distribution.
+        - decoder.std_branch Tensor[b, d] -> Tensor[b, ...]
+            It should return the standard deviation sigma of the decoder distribution.
+        And the regular forward method should be `decoder.complete_forward(z: torch.Tensor) -> Tuple[Tensor, Tensor]` returning the mean and log variance of the decoder distribution.
+    reg_coef : float
+        The regularization coefficient for the metric tensor. Default to 1e-3.
     """
-
-    def __init__(self, decoder: torch.nn.Module, epsilon: float = 1e-4, rho: float = 1e-4):
+    def __init__(self, decoder: torch.nn.Module, reg_coef: float = 1e-3):
         super().__init__()
         self.decoder = decoder
-        self.epsilon = epsilon
-        self.rho = rho
+        self.reg_coef = reg_coef
 
-    def kl(
-        self, normal_0: torch.distributions.Normal, normal_1: torch.distributions.Normal
-    ) -> torch.Tensor:
-        """Compute the KL divergence between two multivariate normal distributions.
-
-        Parameters:
-        ----------
-        normal_0 : torch.distributions.Normal
-            The first normal distribution.
-        normal_1 : torch.distributions.Normal
-            The second normal distribution.
-
-        Returns:
-        -------
-        kl_div : torch.Tensor
-            The KL divergence between the two distributions. Shape: (batch_size,)
-        """
-        kl = torch.distributions.kl_divergence(normal_0, normal_1)
-        dims = normal_0.mean.shape[1:]
-        kl = kl.sum(dim=tuple(range(1, len(dims) + 1)))  # Sum over all dimensions except batch
-        return kl
-
-    def kl_(
-        self,
-        mu_0: torch.Tensor,
-        logvar_0: torch.Tensor,
-        mu_1: torch.Tensor,
-        logvar_1: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute the KL divergence between two multivariate normal distributions given their means and log-variances.
-
-        Parameters:
-        ----------
-        mu_0 : torch.Tensor (B, d)
-            The mean of the first normal distribution.
-        logvar_0 : torch.Tensor (B, d)
-            The log-variance of the first normal distribution, assumed diagonal.
-        mu_1 : torch.Tensor (B, d)
-            The mean of the second normal distribution.
-        logvar_1 : torch.Tensor (B, d)
-            The log-variance of the second normal distribution, assumed diagonal.
-
-        Returns:
-        -------
-        kl_div : torch.Tensor (B,)
-            The KL divergence between the two distributions.
-        """
-        kl = 0.5 * (
-            logvar_1
-            - logvar_0
-            + (torch.exp(logvar_0) + (mu_0 - mu_1) ** 2) / torch.exp(logvar_1)
-            - 1
+        self.pb_mu = PullBackCometric(
+            diffeo=self.decoder.mu_branch,
+            method="finite_difference",
+            reg_coef=0.0,
         )
-        kl = kl.sum(dim=1)  # Sum over all dimensions except batch
-        return kl
-
-    def dot(self, z: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """
-        Computes u^T G(q) v for a batch of points q at tangent vectors u and v.
-        Here we use the polarization identity to avoid to compute the metric tensor explicitly.
-        Ie :
-        u^T G(q) v = 1/4 * ( (u+v)^T G(q) (u+v) - (u-v)^T G(q) (u-v) )
-
-        Parameters:
-        -----------
-        q : Tensor (b, d)
-            Batch of points
-        u : Tensor (b, d)
-            First tangent vector
-        v : Tensor (b, d)
-            Second tangent vector
-
-        Returns:
-        -----------
-        res : Tensor (b,)
-            u^T G(q) v
-        """
-        uv_plus = u + v
-        uv_minus = u - v
-
-        mu_base, logvar_base = self.decoder(z)
-        mu_plus, logvar_plus = self.decoder(z + uv_plus)
-        mu_minus, logvar_minus = self.decoder(z + uv_minus)
-
-        normal_base = torch.distributions.Normal(mu_base, torch.exp(0.5 * logvar_base))
-        normal_plus = torch.distributions.Normal(mu_plus, torch.exp(0.5 * logvar_plus))
-        normal_minus = torch.distributions.Normal(mu_minus, torch.exp(0.5 * logvar_minus))
-
-        fst = self.kl(normal_base, normal_plus)
-        snd = self.kl(normal_base, normal_minus)
-        dot_ = 0.25 * (fst - snd)
-
-        return dot_
-
-    def energy(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        """
-        Computes p^TG(q)p for a batch of tangent vectors p at points q.
-        Here the energy is easily given by the KL divergence between the decoder distributions at z and z+p.
-
-        Parameters:
-        ----------
-        q : Tensor (b, d)
-            Batch of points
-        p : Tensor (b, d)
-            Batch of tangent vectors
-
-        Returns:
-        -------
-        res : Tensor (b,)
-            p^TG(q)p
-        """
-        x_hat_base, logvar_base = self.decoder(z)
-        normal_base = torch.distributions.Normal(x_hat_base, torch.exp(0.5 * logvar_base))
-
-        z_plus = z + p
-        x_hat_plus, logvar_plus = self.decoder(z_plus)
-        normal_plus = torch.distributions.Normal(x_hat_plus, torch.exp(0.5 * logvar_plus))
-
-        return self.kl(normal_base, normal_plus)
-
-    def metric(self, z: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        """
-        Computes the norm sqrt(p^TG(q)p) for a batch of tangent vectors p at points q.
-        Here the norm is easily given by the KL divergence between the decoder distributions at z and z+p.
-
-        Parameters:
-        ----------
-        q : Tensor (b, d)
-            Batch of points
-        p : Tensor (b, d)
-            Batch of tangent vectors
-
-        Returns:
-        -------
-        res : Tensor (b,) sqrt(p^TG(q)p)
-        """
-        return self.energy(z, p).sqrt()
+        self.pb_std = PullBackCometric(
+            diffeo=self.decoder.std_branch,
+            method="finite_difference",
+            reg_coef=0.0,
+        )
 
     def metric_tensor(self, z: torch.Tensor) -> torch.Tensor:
-        """Compute the metric tensor at a given point in the latent space.
+        mu, logvar = self.decoder.complete_forward(z)
+        var = torch.exp(logvar.clamp(-8, 8)).flatten(start_dim=1)  # (batch_size, data_dim)
+        J_mu = self.pb_mu.jacobian(z)  # (batch_size, data_dim, latent_dim)
+        J_std = self.pb_std.jacobian(z)  # (batch_size, data_dim, latent_dim)
 
-        Parameters:
-        ----------
-        z : torch.Tensor
-            The point in the latent space where the metric tensor is computed. Shape: (batch_size, latent_dim)
+        inv_var = (1 / var).unsqueeze(-1)  # (batch_size, data_dim, 1)
+        pb_mu = J_mu.mT @ (inv_var * J_mu)  # (batch_size, latent_dim, latent_dim)
 
-        Returns:
-        -------
-        g : torch.Tensor
-            The metric tensor at point z. Shape: (batch_size, latent_dim, latent_dim)
-        """
-        batch_size, latent_dim = z.shape
-        g = torch.zeros(batch_size, latent_dim, latent_dim, device=z.device)
+        two_over_var = (2 / var).unsqueeze(-1)  # (batch_size, data_dim, 1)
+        pb_var = J_std.mT @ (two_over_var * J_std)  # (batch_size, latent_dim, latent_dim)
 
-        x_hat_base, logvar_base = self.decoder(z)
-        normal_base = torch.distributions.Normal(x_hat_base, torch.exp(0.5 * logvar_base))
-        # Fill the diagonal
-        for i in range(latent_dim):
-            z_plus = z.clone()
-            z_plus[:, i] += self.epsilon
-            x_hat_plus, logvar_plus = self.decoder(z_plus)
-            normal_plus = torch.distributions.Normal(x_hat_plus, torch.exp(0.5 * logvar_plus))
-
-            g[:, i, i] = 2 * self.kl(normal_base, normal_plus) / (self.epsilon**2)
-
-        # Fill the off-diagonal
-        for i in range(latent_dim):
-            for j in range(i + 1, latent_dim):
-                z_plus_i = z.clone()
-                z_plus_i[:, i] += self.epsilon
-                x_hat_plus_i, logvar_plus_i = self.decoder(z_plus_i)
-                normal_plus_i = torch.distributions.Normal(
-                    x_hat_plus_i, torch.exp(0.5 * logvar_plus_i)
-                )
-
-                z_plus_j = z.clone()
-                z_plus_j[:, j] += self.epsilon
-                x_hat_plus_j, logvar_plus_j = self.decoder(z_plus_j)
-                normal_plus_j = torch.distributions.Normal(
-                    x_hat_plus_j, torch.exp(0.5 * logvar_plus_j)
-                )
-
-                z_plus_ij = z.clone()
-                z_plus_ij[:, i] += self.epsilon
-                z_plus_ij[:, j] += self.epsilon
-                x_hat_plus_ij, logvar_plus_ij = self.decoder(z_plus_ij)
-                normal_plus_ij = torch.distributions.Normal(
-                    x_hat_plus_ij, torch.exp(0.5 * logvar_plus_ij)
-                )
-
-                g[:, i, j] = (
-                    self.kl(normal_base, normal_plus_ij)
-                    - self.kl(normal_base, normal_plus_i)
-                    - self.kl(normal_base, normal_plus_j)
-                ) / (self.epsilon**2)
-
-                g[:, j, i] = g[:, i, j]
-
-        # Add rho to the diagonal for numerical stability
-        g = g + self.rho * self.eye(z)
-        return g
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Compute the cometric tensor at a given point in the latent space.
-
-        Parameters:
-        ----------
-        z : torch.Tensor
-            The point in the latent space where the cometric tensor is computed. Shape: (batch_size, latent_dim)
-
-        Returns:
-        -------
-        g : torch.Tensor
-            The cometric tensor at point z. Shape: (batch_size, latent_dim, latent_dim)
-        """
-        return self.metric_tensor(z).inverse()
+        metric_tensor = pb_mu + pb_var + self.reg_coef * self.eye(z)
+        return metric_tensor
 
 
 class PBIG_Cometric(CoMetric):
