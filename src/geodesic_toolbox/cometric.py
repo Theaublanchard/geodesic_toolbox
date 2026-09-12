@@ -144,6 +144,52 @@ class CoMetric(torch.nn.Module):
         super().__init__()
         self.is_diag = is_diag
 
+    def legendre_transform(self, q: Tensor, v: Tensor) -> Tensor:
+        """
+        Computes the Legendre transform of a batch of points q at tangent vectors v.
+        That is, it computes p = G(q) v for a batch of points q at tangent vectors v.
+
+        Parameters:
+        -----------
+        q : Tensor (b, d)
+            Batch of points
+        v : Tensor (b, d)
+            Batch of tangent vectors
+
+        Returns:
+        -------
+        p : Tensor (b, d)
+            Batch of momenta
+        """
+        G = self.metric_tensor(q)
+        if not self.is_diag:
+            return torch.einsum("bij,bj->bi", G, v)
+        else:
+            return G * v
+
+    def inv_legendre_transform(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Computes the inverse Legendre transform of a batch of points q at momenta p.
+        That is, it computes v = G^-1(q) p for a batch of points q at momenta p.
+
+        Parameters:
+        -----------
+        q : Tensor (b, d)
+            Batch of points
+        p : Tensor (b, d)
+            Batch of momenta
+
+        Returns:
+        -------
+        v : Tensor (b, d)
+            Batch of tangent vectors
+        """
+        G_inv = self.cometric_tensor(q)
+        if not self.is_diag:
+            return torch.einsum("bij,bj->bi", G_inv, p)
+        else:
+            return G_inv * p
+
     def inv_logdet(self, q: Tensor) -> Tensor:
         """
         Computes log(det(G^-1(q))) for a batch of points q
@@ -2490,6 +2536,41 @@ class RandersMetrics(FinslerMetric):
             Inverse of the fundamental tensor of the Randers metric at x in the direction of v
         """
         return self.inv_fund_tensor_analytic_(x, v)
+
+    def legendre_transform(self, x: Tensor, v: Tensor,eps: float=1e-8) -> Tensor:
+        """
+        Computes the Legendre transform of the Randers metric
+        at the point x in the direction v.
+        
+        Parameters:
+        ----------
+        x : Tensor (b,d)
+            Points in the manifold
+        v : Tensor (b,d)
+            Tangent vectors at x
+        
+        Returns:
+        -------
+        p : Tensor (b,d)
+            Cotangent vectors at x
+        """
+        G = self.base_cometric.metric_tensor(x)
+        omega = self.beta * self.omega(x)
+
+        if self.base_cometric.is_diag:
+            v_norm = torch.sqrt(torch.einsum("bi,bi->b", G * v, v))
+            Gv = G * v
+        else:
+            v_norm = torch.sqrt(torch.einsum("bij,bj->b", G, v))
+            Gv = torch.einsum("bij,bj->bi", G, v)
+
+        beta = torch.einsum("bi,bi->b", omega, v)
+        F = v_norm + beta
+
+        v_norm = v_norm.clamp(min=eps)[:, None]  # Avoid division by zero
+
+        p = F * (Gv / v_norm[:, None] + omega)
+        return p 
 
 
 class _DualOmegaWrapper(nn.Module):
