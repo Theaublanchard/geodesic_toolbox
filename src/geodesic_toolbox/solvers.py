@@ -23,7 +23,7 @@ from .cometric import (
     RandersMetrics,
     DualRandersMetrics,
 )
-from .samplers import ExplicitLeapfrogIntegrator, ImplicitLeapfrogIntegrator, EulerIntegrator
+from .integrators import ExplicitLeapfrogIntegrator, ImplicitLeapfrogIntegrator, HamiltonianEulerIntegrator
 from .utils import (
     magnification_factor,
     # hamiltonian,
@@ -4135,7 +4135,7 @@ class ExpMapRanders(torch.nn.Module):
                 n_fix_pts=self.n_fix_pts,
             )
         elif self.solver == "euler":
-            self.shooter = EulerIntegrator(
+            self.shooter = HamiltonianEulerIntegrator(
                 H=self.H,
                 gamma=self.dt,
                 substeps=self.substeps,
@@ -4229,7 +4229,7 @@ class ExpMapRanders(torch.nn.Module):
             Momentum along the geodesic trajectory
         """
         p0 = self.legendre_transform(q0, v0)
-        traj_q, traj_p = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
+        traj_q, traj_p, _ = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
         return traj_q, traj_p
 
 
@@ -4295,7 +4295,7 @@ class ExpMapRiemann(torch.nn.Module):
                 n_fix_pts=self.n_fix_pts,
             )
         elif self.solver == "euler":
-            self.shooter = EulerIntegrator(
+            self.shooter = HamiltonianEulerIntegrator(
                 H=self.H,
                 gamma=self.dt,
                 substeps=self.substeps,
@@ -4389,7 +4389,7 @@ class ExpMapRiemann(torch.nn.Module):
             Momentum along the geodesic trajectory
         """
         p0 = self.legendre_transform(q0, v0)
-        traj_q, traj_p = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
+        traj_q, traj_p, _ = self.shooter.forward(q0, p0, self.T, return_traj=True)  # (b,T,2d)
         return traj_q, traj_p
 
 
