@@ -2569,7 +2569,7 @@ class RandersMetrics(FinslerMetric):
 
         v_norm = v_norm.clamp(min=eps)[:, None]  # Avoid division by zero
 
-        p = F * (Gv / v_norm[:, None] + omega)
+        p = F[:, None] * (Gv / v_norm + omega)
         return p 
 
 
