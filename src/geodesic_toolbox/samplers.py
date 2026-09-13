@@ -126,7 +126,12 @@ class Sampler(nn.Module):
         super().__init__()
         self.pbar = pbar
 
-    def sample(self, z_0: Tensor, return_acceptance: bool) -> Tensor | tuple[Tensor, float]:
+    def sample(
+        self,
+        z_0: Tensor,
+        return_traj: bool = False,
+        return_acceptance: bool = False,
+    ) -> Tensor | tuple[Tensor, float]:
         """
         Given an initial sample z_0, it returns a new sample from the target distribution.
 
@@ -134,15 +139,21 @@ class Sampler(nn.Module):
         ----------
         z_0 : Tensor (b,d)
             The initial sample.
+        return_traj : bool
+            If True, return the full sampling trajectory, including ``z_0``.
         return_acceptance : bool
-            If True, it returns the sample aswell as the acceptance rate.
+            If True, return the sample or trajectory together with the acceptance rate.
 
         Returns
         -------
-        Tensor (b,d)
-            The new samples.
+        Tensor (b,d) or Tensor (b,N_run+1,d)
+            The new sample, or the trajectory when ``return_traj`` is True.
         or
-        (Tensor (b,d), float)
+        (Tensor, float)
+            The new sample or trajectory and the acceptance rate when
+            ``return_acceptance`` is True.
+        or
+        The return value does not include the acceptance rate otherwise.
         """
         raise NotImplementedError
 
@@ -285,6 +296,9 @@ class HMCSampler(Sampler):
         If True, it shows a progress bar.
     skip_acceptance : bool
         If True, the acceptance step is skipped. This can be used when differentiabily is needed.
+    H : Hamiltonian | None
+        Optional Hamiltonian override. It must be compatible with the integrator
+        and momentum distribution used by this sampler.
     """
 
     def __init__(
@@ -299,6 +313,8 @@ class HMCSampler(Sampler):
         std_0: float = 1,
         pbar: bool = False,
         skip_acceptance: bool = False,
+        H: Hamiltonian | None = None,
+        compile_step: bool = False,
     ):
         super().__init__(pbar)
         self.cometric = cometric
@@ -309,8 +325,10 @@ class HMCSampler(Sampler):
         self.beta_0_sqrt = beta_0**0.5
         self.std_0 = std_0
         self.skip_acceptance = skip_acceptance
-        self.H = UniformSeparableRiemannHamiltonian(target)
-        self.integrator = SeparableLeapfrogIntegrator(self.H, self.gamma, 1)
+        self.H = H if H is not None else UniformSeparableRiemannHamiltonian(target)
+        self.integrator = SeparableLeapfrogIntegrator(
+            self.H, self.gamma, 1, compile_step=compile_step
+        )
 
     def proposal_rate(self, z: Tensor, v: Tensor, z_new: Tensor, v_new: Tensor) -> Tensor:
         """
@@ -381,7 +399,11 @@ class HMCSampler(Sampler):
 
     @torch.no_grad()
     def sample(
-        self, z_0: Tensor, return_traj=False, progress=False, return_acceptance=False
+        self,
+        z_0: Tensor,
+        return_traj: bool = False,
+        progress: bool = False,
+        return_acceptance: bool = False,
     ) -> Tensor | tuple[Tensor, float]:
         """
         Given an initial sample z_0, it returns a new sample from the target distribution.
@@ -391,22 +413,22 @@ class HMCSampler(Sampler):
         z_0 : Tensor (b,d)
             The initial sample.
         return_traj : bool
-            If True, it returns the trajectory of the samples aswell as the acceptance rate.
+            If True, return the trajectory, including the initial sample.
         progress : bool
             If True, it shows a progress bar when sampling.
         return_acceptance : bool
-            If True, it returns the sample aswell as the acceptance rate.
+            If True, return the sample or trajectory together with the acceptance rate.
 
         Returns
         -------
-        Tensor (b,d)
-            The new samples.
+        Tensor (b,d) or Tensor (b,N_run+1,d)
+            The new sample, or the trajectory when ``return_traj`` is True.
         or
-        (Tensor (b,N_run,d) , float)
-            The trajectory of the samples (the initial sample is the first element) and the acceptance rate.
+        (Tensor, float)
+            The new sample or trajectory and the acceptance rate when
+            ``return_acceptance`` is True.
         or
-        (Tensor (b,d), float)
-            The new samples and the acceptance rate.
+        The return value does not include the acceptance rate otherwise.
         """
         accepted_samples = 0
         z = z_0.clone()
@@ -550,6 +572,9 @@ class ImplicitMidpointRHMCSampler(Sampler):
     reduced_flip : bool
         If True, uses the reduced momentum flip (Sohl-Dickstein 2012) on the
         integration direction upon rejection.
+    H : Hamiltonian | None
+        Optional Hamiltonian override. It must be compatible with the integrator
+        and momentum distribution used by this sampler.
     """
 
     def __init__(
@@ -563,11 +588,13 @@ class ImplicitMidpointRHMCSampler(Sampler):
         pbar: bool = False,
         skip_acceptance=False,
         reduced_flip: bool = True,
+        H: Hamiltonian | None = None,
+        compile_step: bool = False,
     ):
         super().__init__()
         self.cometric = cometric
         self.target = target
-        self.H = UniformRiemannHamiltonian(target, cometric)
+        self.H = H if H is not None else UniformRiemannHamiltonian(target, cometric)
         self.l = l
         self.N_fx = N_fx
         self.gamma = gamma
@@ -576,7 +603,9 @@ class ImplicitMidpointRHMCSampler(Sampler):
         self.skip_acceptance = skip_acceptance
         self.reduced_flip = reduced_flip
 
-        self.integrator = HamiltonianImplicitMidpointIntegrator(self.H, gamma, N_fx)
+        self.integrator = HamiltonianImplicitMidpointIntegrator(
+            self.H, gamma, N_fx, compile_step=compile_step
+        )
 
     def sample_momentum(self, z: Tensor) -> Tensor:
         """Draw p ~ N(0, G(z))."""
@@ -607,10 +636,10 @@ class ImplicitMidpointRHMCSampler(Sampler):
     def sample(
         self,
         z_0: Tensor,
-        return_traj=False,
-        progress=False,
-        return_acceptance=False,
-        return_flip=False,
+        return_traj: bool = False,
+        progress: bool = False,
+        return_acceptance: bool = False,
+        return_flip: bool = False,
     ) -> Tensor | tuple[Tensor, float]:
         """
         Given an initial sample z_0, it returns a new sample from the target
@@ -621,26 +650,24 @@ class ImplicitMidpointRHMCSampler(Sampler):
         z_0 : Tensor (b,d)
             The initial sample.
         return_traj : bool
-            If True, it returns the trajectory of the samples aswell as the
-            acceptance rate.
+            If True, return the trajectory, including the initial sample.
         progress : bool
             If True, it shows a progress bar when sampling.
         return_acceptance : bool
-            If True, it returns the sample aswell as the acceptance rate.
+            If True, return the sample or trajectory together with the acceptance rate.
         return_flip : bool
             If True, it returns the proportion of direction flips over all steps.
 
         Returns
         -------
-        Tensor (b,d)
-            The new samples.
+        Tensor (b,d) or Tensor (b,N_run+1,d)
+            The new sample, or the trajectory when ``return_traj`` is True.
         or
-        (Tensor (b,N_run,d) , float)
-            The trajectory of the samples (the initial sample is the first
-            element) and the acceptance rate.
+        (Tensor, float)
+            The new sample or trajectory and the acceptance rate when
+            ``return_acceptance`` is True.
         or
-        (Tensor (b,d), float)
-            The new samples and the acceptance rate.
+        The return value does not include the acceptance rate otherwise.
         """
         accepted_samples = 0
         flipped_samples = 0
@@ -777,6 +804,9 @@ class ImplicitRHMCSampler(Sampler):
         If True, the acceptance step is skipped. This can be used when differentiabily is needed.
     threshold_fx : float
         The threshold for the fixed point iterations. If the maximum change in the fixed point iterations is less than this threshold, the iterations are stopped.
+    H : Hamiltonian | None
+        Optional Hamiltonian override. It must be compatible with the integrator
+        and momentum distribution used by this sampler.
     """
 
     def __init__(
@@ -792,6 +822,8 @@ class ImplicitRHMCSampler(Sampler):
         pbar: bool = False,
         skip_acceptance: bool = False,
         threshold_fx: float = 1e-5,
+        H: Hamiltonian | None = None,
+        compile_step: bool = False,
     ):
         super().__init__(pbar)
         self.cometric = cometric
@@ -804,137 +836,10 @@ class ImplicitRHMCSampler(Sampler):
         self.beta_0_sqrt = beta_0**0.5
         self.skip_acceptance = skip_acceptance
         self.threshold_fx = threshold_fx
-        self.H = VolumeRiemannHamiltonian(cometric)
-        self.integrator = ImplicitLeapfrogIntegrator(self.H, gamma, N_fx)
-
-    def U(self, z: Tensor) -> Tensor:
-        """
-        Compute the potential energy U(z) = -log(sqrt(det(g_inv(z))))= -1/2 * log(det(g_inv(z)))
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        potential energy : Tensor (b,)
-        """
-        return -0.5 * self.cometric.inv_logdet(z)
-
-    def K(self, v: Tensor, q: Tensor) -> Tensor:
-        """
-        Compute the kinetic energy K(v) = - N(v ;0, g(z))
-        ie K(v) = 1/2 * v^T g_inv(z) v - 1/2 * log(det(g_inv(z)))
-
-        Parameters
-        ----------
-        v : Tensor (b,d)
-            The velocity.
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        kinetic energy : Tensor (b,)
-        """
-        logdet_ginv = self.cometric.inv_logdet(q)
-        velocity = self.cometric.cometric(q, v)
-        return 0.5 * velocity - 0.5 * logdet_ginv + 0.5 * v.shape[1] * self.log2pi
-
-    def H(self, z: Tensor, v: Tensor) -> Tensor:
-        """
-        Compute the Hamiltonian H(z,v) = U(z) + K(v)
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-        v : Tensor (b,d)
-            The velocity.
-
-        Returns
-        -------
-        Tensor (b,)
-        """
-        return self.U(z) + self.K(v, z)
-
-    def get_v_half(self, z: Tensor, v: Tensor) -> Tensor:
-        """
-        Solves the fixed point equation for the velocity.
-        v_half = v - gamma/2 * dH_dz(z, v_half)
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-        v : Tensor (b,d)
-            The velocity.
-
-        Returns
-        -------
-        v_half : Tensor (b,d)
-            The half step velocity.
-        """
-        v_half = v.clone()
-        for k in range(self.N_fx):
-            v_half_ = v_half - self.gamma * self.dH_dz(z, v_half) / 2
-            if (v_half_ - v_half).abs().max() < self.threshold_fx:
-                v_half = v_half_
-                break
-            v_half = v_half_
-        return v_half
-
-    def get_z_new(self, z: Tensor, v_half: Tensor) -> Tensor:
-        """
-        Solves the fixed point equation for the position.
-        z_new = z + gamma/2 * ( dH_dv(z, v_half) + dH_dv(z_new,v_half) )
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-        v_half : Tensor (b,d)
-            The half step velocity.
-
-        Returns
-        -------
-        z_new : Tensor (b,d)
-            The new position.
-        """
-        z_new = z.clone()
-        for k in range(self.N_fx):
-            z_new_ = (
-                z_new + self.gamma * (self.dH_dv(z, v_half) + self.dH_dv(z_new, v_half)) / 2
-            )
-            if (z_new_ - z_new).abs().max() < self.threshold_fx:
-                z_new = z_new_
-                break
-            z_new = z_new_
-        return z_new
-
-    def leapfrog_step(self, z: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
-        """
-        Perform a single leapfrog step.
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The initial position.
-        v : Tensor (b,d)
-            The initial velocity.
-
-        Returns
-        -------
-        z_new : Tensor (b,d)
-            The new position.
-        v_new : Tensor (b,d)
-            The new velocity.
-        """
-        v_half = self.get_v_half(z, v)
-        z_new = self.get_z_new(z, v_half)
-        v_new = v_half - self.gamma * self.dH_dz(z_new, v_half) / 2
-        return z_new, v_new
+        self.H = H if H is not None else VolumeRiemannHamiltonian(cometric)
+        self.integrator = ImplicitLeapfrogIntegrator(
+            self.H, gamma, N_fx, compile_step=compile_step
+        )
 
     def tempering(self, k) -> float:
         """
@@ -1074,7 +979,11 @@ class ImplicitRHMCSampler(Sampler):
 
     @torch.no_grad()
     def sample(
-        self, z_0: Tensor, return_traj=False, progress=False, return_acceptance=False
+        self,
+        z_0: Tensor,
+        return_traj: bool = False,
+        progress: bool = False,
+        return_acceptance: bool = False,
     ) -> Tensor | tuple[Tensor, float]:
         """
         Given an initial sample z_0, it returns a new sample from the target distribution.
@@ -1084,22 +993,22 @@ class ImplicitRHMCSampler(Sampler):
         z_0 : Tensor (b,d)
             The initial sample.
         return_traj : bool
-            If True, it returns the trajectory of the samples aswell as the acceptance rate.
+            If True, return the trajectory, including the initial sample.
         progress : bool
             If True, it shows a progress bar when sampling.
         return_acceptance : bool
-            If True, it returns the sample aswell as the acceptance rate.
+            If True, return the sample or trajectory together with the acceptance rate.
 
         Returns
         -------
-        Tensor (b,d)
-            The new samples.
+        Tensor (b,d) or Tensor (b,N_run+1,d)
+            The new sample, or the trajectory when ``return_traj`` is True.
         or
-        (Tensor (b,N_run,d) , float)
-            The trajectory of the samples (the initial sample is the first element) and the acceptance rate.
+        (Tensor, float)
+            The new sample or trajectory and the acceptance rate when
+            ``return_acceptance`` is True.
         or
-        (Tensor (b,d), float)
-            The new samples and the acceptance rate.
+        The return value does not include the acceptance rate otherwise.
         """
         accepted_samples = 0
         z = z_0.clone()
@@ -1189,6 +1098,9 @@ class ExplicitRHMCSampler(Sampler):
         If True, it shows a progress bar.
     skip_acceptance : bool
         If True, the acceptance step is skipped. This can be used when differentiabily is needed.
+    H : Hamiltonian | None
+        Optional Hamiltonian override. It must be compatible with the integrator
+        and momentum distribution used by this sampler.
     """
 
     def __init__(
@@ -1203,6 +1115,8 @@ class ExplicitRHMCSampler(Sampler):
         beta_0: float = 1,
         pbar: bool = False,
         skip_acceptance: bool = False,
+        H: Hamiltonian | None = None,
+        compile_step: bool = False,
     ):
         super().__init__(pbar)
         self.cometric = cometric
@@ -1220,164 +1134,10 @@ class ExplicitRHMCSampler(Sampler):
         self.register_buffer("c", c, persistent=False)
         self.register_buffer("s", s, persistent=False)
 
-        self.H = VolumeRiemannHamiltonian(cometric)
-        self.integrator = ExplicitLeapfrogIntegrator(self.H, gamma, omega)
-
-    def U(self, z: Tensor) -> Tensor:
-        """
-        Compute the potential energy U(z) = -log(sqrt(det(g_inv(z))))= -1/2 * log(det(g_inv(z)))
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        potential energy : Tensor (b,)
-        """
-        return -0.5 * self.cometric.inv_logdet(z)
-
-    def K(self, v: Tensor, z: Tensor) -> Tensor:
-        """
-        Compute the kinetic energy K(v) = - N(v ;0, g(z))
-        ie K(v) = 1/2 * v^T g_inv(z) v - 1/2 * log(det(g_inv(z)))
-
-        Parameters
-        ----------
-        v : Tensor (b,d)
-            The velocity.
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        kinetic energy : Tensor (b,)
-        """
-        logdet_ginv = self.cometric.inv_logdet(z)
-        velocity = self.cometric.cometric(z, v)
-        return 0.5 * velocity - 0.5 * logdet_ginv + 0.5 * v.shape[1] * self.log2pi
-
-    def H_base(self, z: Tensor, v: Tensor) -> Tensor:
-        """
-        Compute the Hamiltonian H(z,v) = U(z) + K(v)
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-        v : Tensor (b,d)
-            The velocity.
-
-        Returns
-        -------
-        Tensor (b,)
-        """
-        return self.U(z) + self.K(v, z)
-
-    def binding(self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor) -> Tensor:
-        """
-        Compute the binding energy between two states.
-
-        Parameters
-        ----------
-        z_0 : Tensor (b,d)
-            The position of the first state.
-        v_0 : Tensor (b,d)
-            The velocity of the first state.
-        z_1 : Tensor (b,d)
-            The position of the second state.
-        v_1 : Tensor (b,d)
-            The velocity of the second state.
-
-        Returns
-        -------
-        Tensor (b,)
-            The binding energy.
-        """
-        h = torch.linalg.vector_norm(z_1 - z_0, dim=-1) ** 2 / 2
-        h += torch.linalg.vector_norm(v_1 - v_0, dim=-1) ** 2 / 2
-        return h
-
-    def H(self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor) -> Tensor:
-        """
-        Compute the augmented Hamiltonian H(z_0, v_0, z_1, v_1) = H(z_0, v_0) + H(z_1, v_1) + omega * binding(z_0, v_0, z_1, v_1)
-
-        Parameters
-        ----------
-        z_0 : Tensor (b,d)
-            The position of the first state.
-        v_0 : Tensor (b,d)
-            The velocity of the first state.
-        z_1 : Tensor (b,d)
-            The position of the second state.
-        v_1 : Tensor (b,d)
-            The velocity of the second state.
-
-        Returns
-        -------
-        Tensor (b,)
-            The augmented Hamiltonian.
-        """
-        H_0 = self.H_base(z_0, v_0)
-        H_1 = self.H_base(z_1, v_1)
-        H = H_0 + H_1 + self.omega * self.binding(z_0, v_0, z_1, v_1)
-        return H
-
-    def leapfrog_step(
-        self, z_0: Tensor, v_0: Tensor, z_1: Tensor, v_1: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """
-        Leapfrog step for the augmented Hamiltonian.
-        Pseudo code in `Introducing an Explicit Symplectic Integration Scheme for Riemannian Manifold Hamiltonian Monte Carlo`
-        by Cobb et Baydin et al (2019).
-
-        Parameters
-        ----------
-        z_0 : Tensor (b,d)
-            The position of the first state.
-        v_0 : Tensor (b,d)
-            The velocity of the first state.
-        z_1 : Tensor (b,d)
-            The position of the second state.
-        v_1 : Tensor (b,d)
-            The velocity of the second state.
-
-        Returns
-        -------
-        z_0_new : Tensor (b,d)
-            The new position of the first state.
-        v_0_new : Tensor (b,d)
-            The new velocity of the first state.
-        z_1_new : Tensor (b,d)
-            The new position of the second state.
-        v_1_new : Tensor (b,d)
-            The new velocity of the second state.
-        """
-        v_0_new = v_0 - self.gamma / 2 * self.dH_dz(z_0, v_1)
-        z_1_new = z_1 + self.gamma / 2 * self.dH_dv(z_0, v_1)
-        v_1_new = v_1 - self.gamma / 2 * self.dH_dz(z_1_new, v_0)
-        z_0_new = z_0 + self.gamma / 2 * self.dH_dv(z_1_new, v_0)
-
-        z_0_new = (
-            z_0_new + z_1_new + self.c * (z_0_new - z_1_new) + self.s * (v_0_new - v_1_new)
-        ) / 2
-        v_0_new = (
-            v_0_new + v_1_new - self.s * (z_0_new - z_1_new) + self.c * (v_0_new - v_1_new)
-        ) / 2
-        z_1_new = (
-            z_0_new + z_1_new - self.c * (z_0_new - z_1_new) - self.s * (v_0_new - v_1_new)
-        ) / 2
-        v_1_new = (
-            v_0_new + v_1_new + self.s * (z_0_new - z_1_new) - self.c * (v_0_new - v_1_new)
-        ) / 2
-
-        v_1_new = v_1_new - self.gamma / 2 * self.dH_dz(z_1_new, v_0_new)
-        z_0_new = z_0_new + self.gamma / 2 * self.dH_dv(z_1_new, v_0_new)
-        v_0_new = v_0_new - self.gamma / 2 * self.dH_dz(z_0_new, v_1_new)
-        z_1_new = z_1_new + self.gamma / 2 * self.dH_dv(z_0_new, v_1_new)
-
-        return z_0_new, v_0_new, z_1_new, v_1_new
+        self.H = H if H is not None else VolumeRiemannHamiltonian(cometric)
+        self.integrator = ExplicitLeapfrogIntegrator(
+            self.H, gamma, omega, compile_step=compile_step
+        )
 
     def tempering(self, k) -> float:
         """
@@ -1400,12 +1160,8 @@ class ExplicitRHMCSampler(Sampler):
         self,
         z_l_0: Tensor,
         v_l_0: Tensor,
-        z_l_1: Tensor,
-        v_l_1: Tensor,
         z_0: Tensor,
         v0: Tensor,
-        z_1: Tensor,
-        v1: Tensor,
     ) -> Tensor:
         """
         Compute the proposal rates based on the value of the Hamiltonian.
@@ -1416,18 +1172,10 @@ class ExplicitRHMCSampler(Sampler):
             The new position of the first state.
         v_l_0 : Tensor (b,d)
             The new velocity of the first state.
-        z_l_1 : Tensor (b,d)
-            The new position of the second state.
-        v_l_1 : Tensor (b,d)
-            The new velocity of the second state.
         z_0 : Tensor (b,d)
             The initial position of the first state.
         v0 : Tensor (b,d)
             The initial velocity of the first state.
-        z_1 : Tensor (b,d)
-            The initial position of the second state.
-        v1 : Tensor (b,d)
-            The initial velocity of the second state.
 
         Returns
         -------
@@ -1444,11 +1192,8 @@ class ExplicitRHMCSampler(Sampler):
         z_l_0: Tensor,
         v_l_0: Tensor,
         z_l_1: Tensor,
-        v_l_1: Tensor,
         z_0: Tensor,
         v0: Tensor,
-        z_1: Tensor,
-        v1: Tensor,
     ) -> Tensor:
         """
         Compute the proposal rates by combining the proposal_rate method and the bounds.
@@ -1462,23 +1207,17 @@ class ExplicitRHMCSampler(Sampler):
             The new velocity of the first state.
         z_l_1 : Tensor (b,d)
             The new position of the second state.
-        v_l_1 : Tensor (b,d)
-            The new velocity of the second state.
         z_0 : Tensor (b,d)
             The initial position of the first state.
         v0 : Tensor (b,d)
             The initial velocity of the first state.
-        z_1 : Tensor (b,d)
-            The initial position of the second state.
-        v1 : Tensor (b,d)
-            The initial velocity of the second state.
 
         Returns
         -------
         Tensor (b,)
             The proposal rates.
         """
-        alpha = self.proposal_rate(z_l_0, v_l_0, z_l_1, v_l_1, z_0, v0, z_1, v1)
+        alpha = self.proposal_rate(z_l_0, v_l_0, z_0, v0)
         if self.bounds is not None:
             z_0_norm = torch.linalg.norm(z_l_0, dim=-1)
             z_1_norm = torch.linalg.norm(z_l_1, dim=-1)
@@ -1579,7 +1318,13 @@ class ExplicitRHMCSampler(Sampler):
             v = torch.einsum("bij,bi->bj", mat_sqrt(g), v) * self.std_0
         return v
 
-    def sample(self, z_0: Tensor, return_traj=False, progress=False, return_acceptance=False):
+    def sample(
+        self,
+        z_0: Tensor,
+        return_traj: bool = False,
+        progress: bool = False,
+        return_acceptance: bool = False,
+    ) -> Tensor | tuple[Tensor, float]:
         """
         Given an initial sample z_0, it returns a new sample from the target distribution.
 
@@ -1588,22 +1333,22 @@ class ExplicitRHMCSampler(Sampler):
         z_0 : Tensor (b,d)
             The initial sample.
         return_traj : bool
-            If True, it returns the trajectory of the samples aswell as the acceptance rate.
+            If True, return the trajectory, including the initial sample.
         progress : bool
             If True, it shows a progress bar when sampling.
         return_acceptance : bool
-            If True, it returns the sample aswell as the acceptance rate.
+            If True, return the sample or trajectory together with the acceptance rate.
 
         Returns
         -------
-        Tensor (b,d)
-            The new samples.
+        Tensor (b,d) or Tensor (b,N_run+1,d)
+            The new sample, or the trajectory when ``return_traj`` is True.
         or
-        (Tensor (b,N_run,d) , float)
-            The trajectory of the samples (the initial sample is the first element) and the acceptance rate.
+        (Tensor, float)
+            The new sample or trajectory and the acceptance rate when
+            ``return_acceptance`` is True.
         or
-        (Tensor (b,d), float)
-            The new samples and the acceptance rate.
+        The return value does not include the acceptance rate otherwise.
         """
         accepted_samples = 0
         z_0 = z_0.clone()
@@ -1624,7 +1369,7 @@ class ExplicitRHMCSampler(Sampler):
             z_l_0, v_l_0, z_l_1, v_l_1 = self.leapfrog(z_0, v_0, z_1, v_1)
 
             if not self.skip_acceptance:
-                alpha = self.get_alpha(z_l_0, v_l_0, z_l_1, v_l_1, z_0, v_0, z_1, v_1)
+                alpha = self.get_alpha(z_l_0, v_l_0, z_l_1, z_0, v_0)
 
                 u = torch.rand_like(alpha)
                 mask = alpha >= u
