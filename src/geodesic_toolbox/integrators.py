@@ -222,6 +222,7 @@ class ImplicitMidpointIntegrator(torch.nn.Module):
         substeps: int = 1,
         jacobian_mc: int = 1,
         russian_roulette: float = 0.5,
+        compile_step: bool = False,
     ):
         torch.nn.Module.__init__(self)
 
@@ -250,6 +251,10 @@ class ImplicitMidpointIntegrator(torch.nn.Module):
             self.implicit_midpoint_step = self.newton
         else:
             raise ValueError(f"Unknown method {method}. Choose 'picard' or 'newton'.")
+
+        self.step = self.implicit_midpoint_step
+        if compile_step:
+            self.step = torch.compile(self.step, mode="reduce-overhead")
 
     def picard(self, x0: Tensor, gamma: Tensor, tol: float = 1e-8) -> Tensor:
         """
@@ -430,7 +435,7 @@ class ImplicitMidpointIntegrator(torch.nn.Module):
         )
         for k in pbar:
             for _ in range(self.substeps):
-                x1 = self.implicit_midpoint_step(x0, gamma)
+                x1 = self.step(x0, gamma)
                 delta = self.log_det_jac((x0 + x1) / 2, gamma)
                 x0 = x1
                 log_det += delta
@@ -697,10 +702,19 @@ class SeparableLeapfrogIntegrator(HamiltonianIntegrator):
         and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
     """
 
-    def __init__(self, H: Hamiltonian, gamma: float, substeps: int = 1):
+    def __init__(
+        self,
+        H: Hamiltonian,
+        gamma: float,
+        substeps: int = 1,
+        compile_step: bool = False,
+    ):
         super().__init__(H)
         self.gamma = gamma / substeps
         self.substeps = substeps
+        self.step = self.leapfrog_step
+        if compile_step:
+            self.step = torch.compile(self.step, mode="reduce-overhead")
 
     def leapfrog_step(self, q_0: Tensor, p_0: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
         """
@@ -775,7 +789,7 @@ class SeparableLeapfrogIntegrator(HamiltonianIntegrator):
             gamma = dirs.reshape(-1, 1).to(device=q_0.device, dtype=q_0.dtype) * self.gamma
 
         for k in tqdm(range(L - 1), desc="Leapfrog integration", unit="steps", leave=False):
-            q_1, p_1 = self.leapfrog_step(q_1, p_1, gamma)
+            q_1, p_1 = self.step(q_1, p_1, gamma)
 
             if return_traj:
                 if k == L - 2:
@@ -813,11 +827,21 @@ class ImplicitLeapfrogIntegrator(HamiltonianIntegrator):
         and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
     """
 
-    def __init__(self, H: Hamiltonian, gamma: float, n_fix_pts: int, substeps: int = 1):
+    def __init__(
+        self,
+        H: Hamiltonian,
+        gamma: float,
+        n_fix_pts: int,
+        substeps: int = 1,
+        compile_step: bool = False,
+    ):
         super().__init__(H)
         self.n_fix_pts = n_fix_pts
         self.substeps = substeps
         self.gamma = gamma / self.substeps
+        self.step = self.leapfrog_step
+        if compile_step:
+            self.step = torch.compile(self.step, mode="reduce-overhead")
 
     def get_p_half(self, q_0: Tensor, p_0: Tensor, gamma: Tensor) -> Tensor:
         """
@@ -951,7 +975,7 @@ class ImplicitLeapfrogIntegrator(HamiltonianIntegrator):
             gamma = dirs.reshape(-1, 1).to(device=q_0.device, dtype=q_0.dtype) * self.gamma
 
         for k in tqdm(range(L - 1), desc="Leapfrog integration", unit="steps", leave=False):
-            q_1, p_1 = self.leapfrog_step(q_1, p_1, gamma)
+            q_1, p_1 = self.step(q_1, p_1, gamma)
 
             if return_traj:
                 if k == L - 2:
@@ -989,11 +1013,21 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
     """
 
-    def __init__(self, H: Hamiltonian, gamma: float, omega: float, substeps: int = 1):
+    def __init__(
+        self,
+        H: Hamiltonian,
+        gamma: float,
+        omega: float,
+        substeps: int = 1,
+        compile_step: bool = False,
+    ):
         super().__init__(H)
         self.substeps = substeps
         self.gamma = gamma / self.substeps
         self.omega = omega
+        self.step = self.leapfrog_step
+        if compile_step:
+            self.step = torch.compile(self.step, mode="reduce-overhead")
 
         c = torch.Tensor([2 * self.omega * self.gamma]).cos()
         s = torch.Tensor([2 * self.omega * self.gamma]).sin()
@@ -1175,7 +1209,7 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         is_nan: bool = False
         for k in tqdm(range(L - 1), desc="Leapfrog steps", unit="steps", leave=False):
             for _ in range(self.substeps):
-                q_0, p_0, q_1, p_1 = self.leapfrog_step(q_0, p_0, q_1, p_1)
+                q_0, p_0, q_1, p_1 = self.step(q_0, p_0, q_1, p_1)
 
                 if (
                     q_0.isnan().any()
@@ -1252,6 +1286,7 @@ class HamiltonianImplicitMidpointIntegrator(ImplicitMidpointIntegrator, Hamilton
         substeps: int = 1,
         jacobian_mc: int = 1,
         russian_roulette: float = 0.5,
+        compile_step: bool = False,
     ):
         super().__init__(
             HamiltonianToBatchedFunction(H),
@@ -1263,6 +1298,7 @@ class HamiltonianImplicitMidpointIntegrator(ImplicitMidpointIntegrator, Hamilton
             substeps=substeps,
             jacobian_mc=jacobian_mc,
             russian_roulette=russian_roulette,
+            compile_step=compile_step,
         )
 
         self.log_det_jac = self.zero_log_det_jac
