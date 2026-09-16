@@ -576,6 +576,7 @@ class IdentityCoMetric(CoMetric):
 
 # We need to do some tricks to allow for differentiable evaluation.
 
+
 def safe_eigh(A: Tensor) -> tuple[Tensor, Tensor]:
     """
     Batched symmetric eigendecomposition returning NaN for non-finite inputs
@@ -586,7 +587,7 @@ def safe_eigh(A: Tensor) -> tuple[Tensor, Tensor]:
     the whole batch. Here those matrices are swapped for the identity and their
     eigenpairs returned as NaN.
 
-    In the samplign setting, ``proposal_rate`` turns into alpha = 0 for
+    In the sampling setting, ``proposal_rate`` turns into alpha = 0 for
     that sample alone.
 
     Parameters
@@ -610,6 +611,7 @@ def safe_eigh(A: Tensor) -> tuple[Tensor, Tensor]:
     safe_eigenvectors = torch.where(ok.unsqueeze(-1).unsqueeze(-1), Phi, nan)
     return safe_eigenvalues, safe_eigenvectors
 
+
 def mat_sqrt(A: Tensor) -> Tensor:
     """
     Compute the matrix square root of a positive definite matrix A.
@@ -630,25 +632,29 @@ def mat_sqrt(A: Tensor) -> Tensor:
     L = L.where(L > threshold.unsqueeze(-1), zero)  # zero out small components
     return (Q * L.sqrt().unsqueeze(-2)) @ Q.mH
 
+
 def _softabs_g(lam: Tensor, alpha: float) -> Tensor:
     """
     Compute the SoftAbs regularisation function for a
-    batch of eigenvalues lam and a regularisation parameter alpha
-    corresponding to the COMETRIC tensor as:
+    batch of eigenvalues lam and a regularisation parameter alpha.
+    The eigendecomposition is expected to be of the METRIC tensor.
+    So that this function output the regularised eigenvalues
+    of the COMETRIC tensor as:
         reg_eigenvalue = 1/lam * tanh(alpha*lam)
+
     when lam is not too small, and a Taylor expansion around 0 otherwise.
 
     Parameters
     ----------
     lam : Tensor (b, n)
-        Eigenvalues of the cometric tensor
+        Eigenvalues of the metric tensor
     alpha : float
         Regularisation parameter for the SoftAbs
 
-    # SoftAbs COMETRIC eigenvalue g(lam) = tanh(alpha*lam)/lam, i.e. the
-    # reciprocal of the SoftAbs metric eigenvalue lam*coth(alpha*lam). Finite at
-    # lam = 0, where it tends to alpha; a Taylor branch is used near 0 because the
-    # direct expression is 0/0 there.
+    Returns
+    -------
+    Tensor (b, n)
+        Regularised eigenvalues of the cometric tensor
     """
     alpha = float(alpha)
     u = alpha * lam
@@ -740,7 +746,7 @@ def _softabs_gamma(lam: Tensor, alpha: float) -> Tensor:
     Parameters
     ----------
     lam : Tensor (b, n)
-        Eigenvalues of the cometric tensor
+        Eigenvalues of the metric tensor
     alpha : float
         Regularisation parameter for the SoftAbs
 
@@ -869,7 +875,9 @@ class _SoftAbsD1(torch.autograd.Function):
 
 class _SoftAbsCoMetric(torch.autograd.Function):
     """
-    For a matrix H, computes its SoftAbs cometric
+    For a matrix H, computes its SoftAbs cometric reciprocal G^-1(H) = softabs_alpha(H)^-1, with an analytic, degeneracy-safe derivative.
+    The SoftAbs map is a smooth approximation to the absolute value, and is
+    defined as:
         G^-1(H) = Q diag(tanh(alpha*lam)/lam) Q^T,
     where lam, Q are the eigenpairs of H.
     Has analytic backward (Daleckii-Krein) rather than autodiff through ``torch.linalg.eigh``.
@@ -936,7 +944,7 @@ def softabs_cometric(H: Tensor, alpha: float) -> Tensor:
     Parameters
     ----------
     H : Tensor (b, n, n)
-        Batch of symmetric matrices (the Hessian of the log density).
+        Batch of symmetric matrices ( eg the Hessian of the log density or a metric tensor).
     alpha : float
         SoftAbs sharpness. G^-1 -> |H|^-1 as alpha -> infinity.
 
@@ -951,6 +959,7 @@ def softabs_cometric(H: Tensor, alpha: float) -> Tensor:
 class SoftAbsCometric(CoMetric):
     """
     Cometric that applies the SoftAbs regularisation to a base cometric.
+    'A General Metric for Riemannian Manifold Hamiltonian Monte Carlo'
 
     Parameters:
     -----------
@@ -968,7 +977,9 @@ class SoftAbsCometric(CoMetric):
         self.alpha = alpha
 
     def cometric_tensor(self, q: Tensor) -> Tensor:
-        g = self.base_cometric.cometric_tensor(q)
+        g = self.base_cometric.metric_tensor(q)
+        if self.base_cometric.is_diag:
+            raise NotImplementedError("SoftAbs for diagonal cometrics not implemented yet")
         g_soft = softabs_cometric(g, self.alpha)
         return g_soft
 
@@ -977,8 +988,7 @@ class SoftAbsCometric(CoMetric):
         return torch.linalg.inv(g_soft)
 
     def forward(self, q: Tensor) -> Tensor:
-        g_soft = self.metric_tensor(q)
-        return torch.linalg.inv(g_soft)
+        return self.cometric_tensor(q)
 
 
 ################################################################
