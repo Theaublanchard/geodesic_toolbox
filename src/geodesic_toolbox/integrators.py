@@ -1084,7 +1084,12 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         return H
 
     def leapfrog_step(
-        self, q_0: Tensor, p_0: Tensor, q_1: Tensor, p_1: Tensor
+        self,
+        q_0: Tensor,
+        p_0: Tensor,
+        q_1: Tensor,
+        p_1: Tensor,
+        gamma: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Leapfrog step for the augmented Hamiltonian.
@@ -1101,6 +1106,9 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
             The position of the second state.
         p_1 : Tensor (b,d)
             The momentum of the second state.
+        gamma : Tensor (b,1) | None
+            The step size for each batch. If None, it uses self.gamma.
+            Used when we want to integrate in different directions for each batch.
 
         Returns
         -------
@@ -1113,13 +1121,17 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         p_1_new : Tensor (b,d)
             The new momentum of the second state.
         """
-        c = self.c.to(q_0.device).to(q_0.dtype)
-        s = self.s.to(q_0.device).to(q_0.dtype)
+        if gamma is None:
+            gamma = torch.full(
+                (q_0.shape[0], 1), self.gamma, device=q_0.device, dtype=q_0.dtype
+            )
+        c = torch.cos(2 * self.omega * gamma)
+        s = torch.sin(2 * self.omega * gamma)
 
-        p_0_new = p_0 - self.gamma / 2 * self.H.dH_dq(q_0, p_1)
-        q_1_new = q_1 + self.gamma / 2 * self.H.dH_dp(q_0, p_1)
-        p_1_new = p_1 - self.gamma / 2 * self.H.dH_dq(q_1_new, p_0)
-        q_0_new = q_0 + self.gamma / 2 * self.H.dH_dp(q_1_new, p_0)
+        p_0_new = p_0 - gamma / 2 * self.H.dH_dq(q_0, p_1)
+        q_1_new = q_1 + gamma / 2 * self.H.dH_dp(q_0, p_1)
+        p_1_new = p_1 - gamma / 2 * self.H.dH_dq(q_1_new, p_0)
+        q_0_new = q_0 + gamma / 2 * self.H.dH_dp(q_1_new, p_0)
 
         # Apply the binding map simultaneously from the same pre-rotation state.
         q0_pre, p0_pre = q_0_new, p_0_new
@@ -1130,10 +1142,10 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         q_1_new = (q0_pre + q1_pre - c * (q0_pre - q1_pre) - s * (p0_pre - p1_pre)) / 2
         p_1_new = (p0_pre + p1_pre + s * (q0_pre - q1_pre) - c * (p0_pre - p1_pre)) / 2
 
-        p_1_new = p_1_new - self.gamma / 2 * self.H.dH_dq(q_1_new, p_0_new)
-        q_0_new = q_0_new + self.gamma / 2 * self.H.dH_dp(q_1_new, p_0_new)
-        p_0_new = p_0_new - self.gamma / 2 * self.H.dH_dq(q_0_new, p_1_new)
-        q_1_new = q_1_new + self.gamma / 2 * self.H.dH_dp(q_0_new, p_1_new)
+        p_1_new = p_1_new - gamma / 2 * self.H.dH_dq(q_1_new, p_0_new)
+        q_0_new = q_0_new + gamma / 2 * self.H.dH_dp(q_1_new, p_0_new)
+        p_0_new = p_0_new - gamma / 2 * self.H.dH_dq(q_0_new, p_1_new)
+        q_1_new = q_1_new + gamma / 2 * self.H.dH_dp(q_0_new, p_1_new)
 
         return q_0_new, p_0_new, q_1_new, p_1_new
 
@@ -1144,14 +1156,41 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         p_0: Tensor,
         L: int,
         return_traj: bool = False,
+        dirs: Tensor | None = None,
     ):
         """Integrate identical initial copies and return the first copy.
 
         The returned `log_det` is the Jacobian of the full two-copy
         augmented map used by `forward_augmented`, which is zero. It is
         not the Jacobian of the projected first-copy map alone.
+
+        Parameters
+        ----------
+        q_0 : Tensor (b,d)
+            The initial position.
+        p_0 : Tensor (b,d)
+            The initial momentum.
+        L : int
+            The number of leapfrog steps to perform.
+        return_traj : bool
+            If True, it returns the trajectory of the samples over the L leapfrog steps.
+            Otherwise, it returns the final state after L steps.
+        dirs : Tensor (b,) | None
+            Per-batch integration direction (+1 forward, -1 backward). If None, all samples are integrated forward.
+
+        Returns
+        -------
+        q_L : Tensor (b,d)
+            The new position after L leapfrog steps.
+        p_L : Tensor (b,d)
+            The new momentum after L leapfrog steps.
+        or
+        (Tensor (b,L,d), Tensor (b,L,d))
+            The trajectory of the positions and momenta over the L leapfrog steps.
         """
-        result = self.forward_augmented(q_0, p_0, L, return_traj=return_traj, q_1=q_0, p_1=p_0)
+        result = self.forward_augmented(
+            q_0, p_0, L, return_traj=return_traj, q_1=q_0, p_1=p_0, dirs=dirs
+        )
         if return_traj:
             traj_q_0, traj_p_0, _, _, log_det = result
             return traj_q_0, traj_p_0, log_det
@@ -1167,6 +1206,7 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         q_1: Tensor,
         p_1: Tensor,
         return_traj: bool = False,
+        dirs: Tensor | None = None,
     ):
         """
         Perform L-1 leapfrog steps with the augmented Hamiltonian.
@@ -1186,6 +1226,12 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
             The number of leapfrog steps to perform.
         return_traj : bool
             If True, it returns the trajectory of the samples over the L leapfrog steps.
+        q_1 : Tensor (b,d)
+            The initial position of the second copy.
+        p_1 : Tensor (b,d)
+            The initial momentum of the second copy.
+        dirs : Tensor (b,) | None
+            Per-batch integration direction (+1 forward, -1 backward). If None, all samples are integrated forward.
 
         Returns
         -------
@@ -1206,24 +1252,28 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
             traj_q_1 = [q_1.clone().detach()]
             traj_p_1 = [p_1.clone().detach()]
 
-        is_nan: bool = False
+        if dirs is None:
+            gamma = torch.full(
+                (q_0.shape[0], 1), self.gamma, device=q_0.device, dtype=q_0.dtype
+            )
+        else:
+            gamma = dirs.reshape(-1, 1).to(device=q_0.device, dtype=q_0.dtype) * self.gamma
+
+        integration_failed = False
         for k in tqdm(range(L - 1), desc="Leapfrog steps", unit="steps", leave=False):
             for _ in range(self.substeps):
-                q_0, p_0, q_1, p_1 = self.step(q_0, p_0, q_1, p_1)
+                q_0, p_0, q_1, p_1 = self.step(q_0, p_0, q_1, p_1, gamma)
 
                 if (
-                    q_0.isnan().any()
-                    or p_0.isnan().any()
-                    or q_1.isnan().any()
-                    or p_1.isnan().any()
+                    not torch.isfinite(q_0).all()
+                    or not torch.isfinite(p_0).all()
+                    or not torch.isfinite(q_1).all()
+                    or not torch.isfinite(p_1).all()
                 ):
-                    # raise ValueError("NaN values encountered in leapfrog step.")
-                    print("NaN values encountered in leapfrog step.")
-                    is_nan = True
+                    integration_failed = True
                     break
 
-            if is_nan:
-                ...
+            if integration_failed:
                 break
 
             if return_traj:
