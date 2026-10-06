@@ -56,15 +56,23 @@ def integrate_isolating_failures(
         Validity mask. Where the mask is False the integration failed, the state is left at ``x_0`` and the caller must reject the sample.
     """
     b = x_0.shape[0]
-    valid = torch.ones(b, dtype=torch.bool, device=x_0.device)
+
+    def valid_outputs(x_l: Tensor, log_det: Tensor) -> Tensor:
+        """Return the samples with finite states and log-Jacobians."""
+        return torch.isfinite(x_l).all(dim=-1) & torch.isfinite(log_det)
+
     try:
         x_l, log_det = integrator(x_0, L, dirs=dirs)
-        return x_l, log_det, valid
+        valid = valid_outputs(x_l, log_det)
+        if valid.all():
+            return x_l, log_det, valid
     except _LinAlgError:
-        pass
+        x_l = x_0
+        log_det = torch.zeros(b, device=x_0.device, dtype=x_0.dtype)
 
     x_l = x_0.clone()
     log_det = torch.zeros(b, device=x_0.device, dtype=x_0.dtype)
+    valid = torch.zeros(b, dtype=torch.bool, device=x_0.device)
     for i in range(b):
         try:
             x_i, log_det_i = integrator(
@@ -72,9 +80,12 @@ def integrate_isolating_failures(
                 L,
                 dirs=None if dirs is None else dirs[i : i + 1],
             )
-            x_l[i], log_det[i] = x_i[0], log_det_i[0]
+            valid_i = valid_outputs(x_i, log_det_i)[0]
+            if valid_i:
+                x_l[i], log_det[i] = x_i[0], log_det_i[0]
+                valid[i] = True
         except _LinAlgError:
-            valid[i] = False
+            continue
     return x_l, log_det, valid
 
 
@@ -85,18 +96,60 @@ def integrate_hamiltonian_isolating_failures(
     L: int,
     dirs: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Integrate Hamiltonian states while isolating batch-wide failures."""
+    """Integrate Hamiltonian states while isolating batch-wide failures.
+
+    Non-finite positions, momenta, and log-Jacobians are treated as
+    per-chain integration failures.
+
+    Parameters
+    ----------
+    integrator : HamiltonianIntegrator
+        Hamiltonian integrator used to evolve the states.
+    q_0 : Tensor (b, d)
+        Batch of initial positions.
+    p_0 : Tensor (b, d)
+        Batch of initial momenta.
+    L : int
+        Number of integration steps to perform.
+    dirs : Tensor (b,) | None
+        Optional per-sample integration directions, forwarded to the
+        integrator.
+
+    Returns
+    -------
+    q_l : Tensor (b, d)
+        Final positions. Failed samples retain their initial positions.
+    p_l : Tensor (b, d)
+        Final momenta. Failed samples retain their initial momenta.
+    log_det : Tensor (b,)
+        Log-Jacobians of the transformation. Failed samples receive zero.
+    valid : Tensor (b,) bool
+        Per-sample validity mask. False entries identify failed integrations.
+    """
     b = q_0.shape[0]
-    valid = torch.ones(b, dtype=torch.bool, device=q_0.device)
+
+    def valid_outputs(q_l: Tensor, p_l: Tensor, log_det: Tensor) -> Tensor:
+        """Return the samples with finite positions, momenta, and Jacobians."""
+        return (
+            torch.isfinite(q_l).all(dim=-1)
+            & torch.isfinite(p_l).all(dim=-1)
+            & torch.isfinite(log_det)
+        )
+
     try:
         q_l, p_l, log_det = integrator.forward(q_0, p_0, L, dirs=dirs)
-        return q_l, p_l, log_det, valid
+        valid = valid_outputs(q_l, p_l, log_det)
+        if valid.all():
+            return q_l, p_l, log_det, valid
     except _LinAlgError:
-        pass
+        q_l = q_0
+        p_l = p_0
+        log_det = torch.zeros(b, device=q_0.device, dtype=q_0.dtype)
 
     q_l = q_0.clone()
     p_l = p_0.clone()
     log_det = torch.zeros(b, device=q_0.device, dtype=q_0.dtype)
+    valid = torch.zeros(b, dtype=torch.bool, device=q_0.device)
     for i in range(b):
         try:
             q_i, p_i, log_det_i = integrator.forward(
@@ -105,384 +158,302 @@ def integrate_hamiltonian_isolating_failures(
                 L,
                 dirs=None if dirs is None else dirs[i : i + 1],
             )
-            q_l[i], p_l[i] = q_i[0], p_i[0]
-            log_det[i] = log_det_i[0]
+            valid_i = valid_outputs(q_i, p_i, log_det_i)[0]
+            if valid_i:
+                q_l[i], p_l[i] = q_i[0], p_i[0]
+                log_det[i] = log_det_i[0]
+                valid[i] = True
         except _LinAlgError:
-            valid[i] = False
+            continue
     return q_l, p_l, log_det, valid
 
 
 class Sampler(nn.Module):
-    """
-    Base class for the MCMC samplers. It defines the interface for the samplers.
+    """Base class for batch MCMC samplers.
 
     Parameters
     ----------
     pbar : bool
-        If True, it shows a progress bar when sampling.
+        If True, display a progress bar while collecting samples.
     """
 
     def __init__(self, pbar: bool = False):
         super().__init__()
         self.pbar = pbar
 
-    def sample(
-        self,
-        z_0: Tensor,
-        return_traj: bool = False,
-        return_acceptance: bool = False,
-    ) -> Tensor | tuple[Tensor, float]:
-        """
-        Given an initial sample z_0, it returns a new sample from the target distribution.
+    def step(self, state: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        """Advance every chain by one MCMC transition.
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
-            The initial sample.
-        return_traj : bool
-            If True, return the full sampling trajectory, including ``z_0``.
-        return_acceptance : bool
-            If True, return the sample or trajectory together with the acceptance rate.
+        state : Tensor (num_chains, dimension)
+            Current position of each chain.
 
         Returns
         -------
-        Tensor (b,d) or Tensor (b,N_run+1,d)
-            The new sample, or the trajectory when ``return_traj`` is True.
-        or
-        (Tensor, float)
-            The new sample or trajectory and the acceptance rate when
-            ``return_acceptance`` is True.
-        or
-        The return value does not include the acceptance rate otherwise.
+        next_state : Tensor (num_chains, dimension)
+            Position after the transition.
+        diagnostics : dict[str, Tensor]
+            Per-chain transition diagnostics.
         """
         raise NotImplementedError
 
-    @torch.no_grad()
-    def forward(
-        self, z_0: Tensor, n: int, return_acceptance: bool = False
-    ) -> Tensor | tuple[Tensor, float]:
-        """
-        Given initial samples z_0, it returns n new samples for each initial sample.
-
-        Beware that tuning both the batch-size and n is important to avoid using too
-        much memory.
+    def sample(
+        self, initial_state: Tensor, num_warmup: int, num_samples: int
+    ) -> tuple[Tensor, dict[str, object]]:
+        """Run warmup and collect post-warmup states.
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
-            The initial samples.
-        n : int
-            The number of samples to generate for each initial sample.
-        return_acceptance : bool
-            If True, it returns the samples aswell as the acceptance rate.
+        initial_state : Tensor (num_chains, dimension)
+            Initial position of each chain.
+        num_warmup : int
+            Number of transitions to discard before collecting samples.
+        num_samples : int
+            Number of post-warmup transitions to retain.
 
         Returns
         -------
-        Tensor (b,n,d)
-            The new samples.
-        or
-        (Tensor (b,n,d), float)
-            The new samples and the acceptance rate.
+        samples : Tensor (num_chains, num_samples, dimension)
+            Collected chain states. Rejected transitions remain repeated states.
+        diagnostics : dict[str, object]
+            Aggregate and per-transition sampling diagnostics.
         """
-        new_samples = []
-        acceptance_rate = []
-
-        # If the batch_size is bigger then the number of samples to generate
-        # We process the sampling batch-wise, otherwise we process the sampling
-        # sample-wise.
-        if z_0.shape[0] > n:
-            pbar = tqdm(range(n)) if self.pbar else range(n)
-            for k in pbar:
-                z_new, acc_rate = self.sample(z_0, return_acceptance=True)
-                acceptance_rate.append(acc_rate)
-                new_samples.append(z_new)
-            new_samples = torch.stack(new_samples, dim=1)
-
-        else:
-            pbar = tqdm(range(z_0.shape[0])) if self.pbar else range(z_0.shape[0])
-            for k in pbar:
-                z_batch = z_0[k].repeat(n, 1)
-                z_new, acc_rate = self.sample(z_batch, return_acceptance=True)
-                acceptance_rate.append(acc_rate)
-                new_samples.append(z_new)
-            new_samples = torch.stack(new_samples, dim=0)
-
-        acceptance_rate = torch.Tensor(acceptance_rate).mean().item()
-
-        if return_acceptance:
-            return new_samples, acceptance_rate
-        else:
-            return new_samples
+        raise NotImplementedError
 
 
-class UniformSeparableRiemannHamiltonian(Hamiltonian):
-    def __init__(self, target: Callable[[Tensor], Tensor]):
+class EuclideanHamiltonian(Hamiltonian):
+    """Separable Euclidean Hamiltonian for an unnormalized log-density.
+
+    Parameters
+    ----------
+    log_target : Callable[[Tensor], Tensor]
+        Unnormalized log-density mapping ``(num_chains, dimension)`` positions
+        to ``(num_chains,)`` values.
+    momentum_std : float
+        Standard deviation of the independent Gaussian momentum.
+    """
+
+    def __init__(self, log_target: Callable[[Tensor], Tensor], momentum_std: float = 1.0):
         super().__init__()
-        self.target = target
+        if momentum_std <= 0:
+            raise ValueError("momentum_std must be positive.")
+        self.log_target = log_target
+        self.momentum_std = momentum_std
 
-    def U(self, z: Tensor) -> Tensor:
-        """
-        Compute the potential energy U(z) = -log(sqrt(det(g_inv(z))))= -1/2 * log(det(g_inv(z)))
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        potential energy : Tensor (b,)
-        """
-        return -0.5 * self.target(z).log()
-
-    def K(self, p: Tensor) -> Tensor:
-        """
-        Compute the kinetic energy K(p) = 1/2 * p^T p
+    def U(self, q: Tensor) -> Tensor:
+        """Return the potential energy ``-log_target(q)``.
 
         Parameters
         ----------
-        p : Tensor (b,d)
-            The momentum.
-
-        Returns
-        -------
-        kinetic energy : Tensor (b,)
-        """
-        return 1 / 2 * torch.einsum("bi,bi->b", p, p)  # p^T @ p
-
-    def forward(self, z: Tensor, p: Tensor) -> Tensor:
-        """
-        Compute the Hamiltonian H(z,p) = U(z) + K(p)
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-        p : Tensor (b,d)
-            The momentum.
+        q : Tensor (b, d)
+            Batch of positions.
 
         Returns
         -------
         Tensor (b,)
-            The Hamiltonian.
+            Potential energy of each position.
         """
-        return self.U(z) + self.K(p)
+        return -self.log_target(q)
+
+    def K(self, p: Tensor) -> Tensor:
+        """Return the kinetic energy of the Gaussian momentum.
+
+        Parameters
+        ----------
+        p : Tensor (b, d)
+            Batch of momenta.
+
+        Returns
+        -------
+        Tensor (b,)
+            Kinetic energy of each momentum.
+        """
+        return 0.5 * torch.einsum("bi,bi->b", p, p) / self.momentum_std**2
+
+    def forward(self, q: Tensor, p: Tensor) -> Tensor:
+        """Evaluate the Hamiltonian for batched positions and momenta.
+
+        Parameters
+        ----------
+        q : Tensor (b, d)
+            Batch of positions.
+        p : Tensor (b, d)
+            Batch of momenta.
+
+        Returns
+        -------
+        Tensor (b,)
+            Hamiltonian for each position and momentum pair.
+        """
+        return self.U(q) + self.K(p)
 
 
-class HMCSampler(Sampler):
-    """
-    Hamiltonian Monte Carlo sampler with a pdf defined on a manifold.
-    It uses the leapfrog integrator to propose new samples from the target distribution.
-    The hamiltonian dynamics should be of the form:
-    H(p,q) = U(q) + p^T p / 2  (separable Hamiltonian)
+class HamiltonianMonteCarlo(Sampler):
+    """Euclidean Hamiltonian Monte Carlo for an unnormalized log-density.
+
+    Parameters are algorithmic settings; the number of warmup and retained
+    transitions is supplied to :meth:`sample`.
 
     Parameters
     ----------
-    cometric : CoMetric
-        The cometric that defines the target distribution.
-    l : int
-        The number of leapfrog steps.
-    gamma : float
-        The step size.
-    N_run : int
-        The number of iterations.
-    bounds : float
-        The bounds of the target distribution. This is because the distribution must be supported on a bounded set.
-    beta_0 : float
-        The initial temperature for the tempering of the momentum.
-    std_0 : float
-        The standard deviation of the initial momentum.
+    log_target : Callable[[Tensor], Tensor]
+        Unnormalized log-density, maps (b, d) positions to (b,) log-densities.
+    num_integration_steps : int
+        Number of leapfrog steps per proposal.
+    step_size : float
+        Leapfrog step size.
+    momentum_std : float
+        Standard deviation of the Euclidean momentum distribution.
+    bounds : float | None
+        Optional bounds on the support of the target distribution. If provided,
+        proposals outside the bounds are rejected directly.
     pbar : bool
-        If True, it shows a progress bar.
-    skip_acceptance : bool
-        If True, the acceptance step is skipped. This can be used when differentiabily is needed.
-    H : Hamiltonian | None
-        Optional Hamiltonian override. It must be compatible with the integrator
-        and momentum distribution used by this sampler.
+        If True, it shows a progress bar when sampling.
+    compile_step : bool
+        If True, compile the leapfrog integrator step with ``torch.compile``.
     """
 
     def __init__(
         self,
-        target: Callable[[Tensor], Tensor],
-        cometric: CoMetric,
-        l: int,
-        gamma: float,
-        N_run: int,
-        bounds: float = 1e3,
-        beta_0: float = 1,
-        std_0: float = 1,
+        log_target: Callable[[Tensor], Tensor],
+        num_integration_steps: int,
+        step_size: float,
+        momentum_std: float = 1.0,
+        bounds: float | None = None,
         pbar: bool = False,
-        skip_acceptance: bool = False,
-        H: Hamiltonian | None = None,
-        compile_step: bool = False,
+        compile_step: bool = True,
     ):
         super().__init__(pbar)
-        self.cometric = cometric
-        self.l = l
-        self.gamma = gamma
-        self.N_run = N_run
+        if num_integration_steps < 1:
+            raise ValueError("num_integration_steps must be positive.")
+        if step_size <= 0:
+            raise ValueError("step_size must be positive.")
+        self.num_integration_steps = num_integration_steps
         self.bounds = bounds
-        self.beta_0_sqrt = beta_0**0.5
-        self.std_0 = std_0
-        self.skip_acceptance = skip_acceptance
-        self.H = H if H is not None else UniformSeparableRiemannHamiltonian(target)
+        self.hamiltonian = EuclideanHamiltonian(log_target, momentum_std)
         self.integrator = SeparableLeapfrogIntegrator(
-            self.H, self.gamma, 1, compile_step=compile_step
+            self.hamiltonian, step_size, compile_step=compile_step
         )
 
-    def proposal_rate(self, z: Tensor, v: Tensor, z_new: Tensor, v_new: Tensor) -> Tensor:
+    @torch.no_grad()
+    def step(self, state: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """
-        Compute the proposal rates based on the value of the Hamiltonian.
+        Perform a single HMC step.
 
         Parameters
         ----------
-        z : Tensor (b,d)
-            The initial position.
-        v : Tensor (b,d)
-            The initial velocity.
-        z_new : Tensor (b,d)
-            The new position.
-        v_new : Tensor (b,d)
-            The new velocity.
+        state : Tensor (B, d)
+            Current state of the Markov chain
 
         Returns
         -------
-        Tensor (b,)
-            The proposal rates.
+        next_state : Tensor (B, d)
+            Next state of the Markov chain
+        diagnostics : dict[str, Tensor]
+            Diagnostic information about the step.
         """
-        alpha = torch.exp(-self.H(z_new, v_new) + self.H(z, v))
-        return torch.min(torch.ones_like(alpha), alpha)
-
-    def get_alpha(self, z: Tensor, v: Tensor, z_new: Tensor, v_new: Tensor) -> Tensor:
-        """
-        Compute the proposal rates by combining the proposal_rate method and the bounds.
-        If the new sample is out of bounds, the proposal rate is 0.
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The initial position.
-        v : Tensor (b,d)
-            The initial velocity.
-        z_new : Tensor (b,d)
-            The new position.
-        v_new : Tensor (b,d)
-            The new velocity.
-
-        Returns
-        -------
-        Tensor (b,)
-            The proposal rates.
-        """
-        alpha = self.proposal_rate(z, v, z_new, v_new)
-        z_norm = torch.linalg.norm(z_new, dim=-1)
+        if state.ndim != 2:
+            raise ValueError("state must have shape (num_chains, dimension).")
+        momentum = torch.randn_like(state) * self.hamiltonian.momentum_std
+        # No need to compute the log_det here since the leapfrog integrator is symplectic (log_det = 0)
+        proposal, proposal_momentum, _ = self.integrator(
+            state,
+            momentum,
+            self.num_integration_steps + 1,
+        )
+        log_alpha = self.hamiltonian(state, momentum) - self.hamiltonian(
+            proposal, proposal_momentum
+        )
         if self.bounds is not None:
-            out_of_bounds = z_norm > self.bounds
-            alpha[out_of_bounds] = 0
-        return alpha
-
-    def sample_momentum(self, z: Tensor) -> Tensor:
-        """
-        Sample Euclidean momentum from N(0, I), scaled by ``std_0``.
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        v : Tensor (b,d)
-            The sampled momentum.
-        """
-        return torch.randn_like(z) * self.std_0
+            log_alpha = torch.where(
+                torch.linalg.norm(proposal, dim=-1) <= self.bounds,
+                log_alpha,
+                torch.full_like(log_alpha, -torch.inf),
+            )
+        acceptance_probability = torch.exp(torch.clamp(log_alpha, max=0.0))
+        acceptance_probability = torch.nan_to_num(acceptance_probability, nan=0.0)
+        accepted = torch.rand_like(acceptance_probability) < acceptance_probability
+        next_state = torch.where(accepted[:, None], proposal, state)
+        return next_state, {
+            "accepted": accepted,
+            "acceptance_probability": acceptance_probability,
+        }
 
     @torch.no_grad()
     def sample(
-        self,
-        z_0: Tensor,
-        return_traj: bool = False,
-        progress: bool = False,
-        return_acceptance: bool = False,
-    ) -> Tensor | tuple[Tensor, float]:
+        self, initial_state: Tensor, num_warmup: int, num_samples: int
+    ) -> tuple[Tensor, dict[str, object]]:
         """
-        Given an initial sample z_0, it returns a new sample from the target distribution.
+        Sample from the target distribution using HMC.
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
-            The initial sample.
-        return_traj : bool
-            If True, return the trajectory, including the initial sample.
-        progress : bool
-            If True, it shows a progress bar when sampling.
-        return_acceptance : bool
-            If True, return the sample or trajectory together with the acceptance rate.
+        initial_state : Tensor (B, d)
+            Initial state of the Markov chain.
+        num_warmup : int
+            Number of warmup transitions discarded before collection.
+        num_samples : int
+            Number of samples to collect after warmup.
 
         Returns
         -------
-        Tensor (b,d) or Tensor (b,N_run+1,d)
-            The new sample, or the trajectory when ``return_traj`` is True.
-        or
-        (Tensor, float)
-            The new sample or trajectory and the acceptance rate when
-            ``return_acceptance`` is True.
-        or
-        The return value does not include the acceptance rate otherwise.
+        samples : Tensor (B, num_samples, d)
+            Collected samples after warmup.
+        diagnostics : dict[str, object]
+            Aggregate acceptance rates and per-transition probabilities.
         """
-        accepted_samples = 0
-        z = z_0.clone()
+        if initial_state.ndim != 2:
+            raise ValueError("initial_state must have shape (num_chains, dimension).")
+        if num_warmup < 0:
+            raise ValueError("num_warmup must be non-negative.")
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive.")
 
-        if return_traj:
-            traj = [z.clone()]
+        state = initial_state.clone()
+        warmup_accepted = 0
+        for _ in range(num_warmup):
+            state, transition = self.step(state)
+            warmup_accepted += transition["accepted"].sum().item()
 
-        if progress:
-            pbar = tqdm(range(self.N_run), desc="Sampling", unit="steps")
-        else:
-            pbar = range(self.N_run)
+        samples = []
+        accepted = []
+        probabilities = []
+        iterator = (
+            tqdm(range(num_samples), desc="Sampling", unit="draws")
+            if self.pbar
+            else range(num_samples)
+        )
+        for _ in iterator:
+            state, transition = self.step(state)
+            samples.append(state.clone())
+            accepted.append(transition["accepted"])
+            probabilities.append(transition["acceptance_probability"])
 
-        for k in pbar:
-            v_0 = self.sample_momentum(z)
-
-            # A linear-algebra failure is batch-wide and anonymous, so isolate
-            # the offending samples instead of rejecting the whole batch.
-            z_l, v_l, _, valid = integrate_hamiltonian_isolating_failures(
-                self.integrator, z, v_0, self.l
-            )
-            alpha = self.get_alpha(z, v_0, z_l, v_l)
-            alpha = torch.where(valid, alpha, torch.zeros_like(alpha))
-
-            if not self.skip_acceptance:
-                u = torch.rand_like(alpha)
-                mask = alpha >= u
-                z = torch.where(mask[:, None], z_l, z)
-                accepted_samples += mask.sum().item()
-            else:
-                z = z_l
-                accepted_samples += z.shape[0]
-
-            if return_traj:
-                traj.append(z.clone())
-
-            if progress:
-                pbar.set_postfix(
-                    {"acceptance_rate": accepted_samples / ((k + 1) * z_0.shape[0])}
-                )
-
-        acceptance_rate = accepted_samples / (self.N_run * z_0.shape[0])
-
-        if return_traj:
-            traj = torch.stack(traj, dim=1)
-            if return_acceptance:
-                return traj, acceptance_rate
-            else:
-                return traj
-        if return_acceptance:
-            return z, acceptance_rate
-        return z
+        accepted_tensor = torch.stack(accepted, dim=1)
+        probability_tensor = torch.stack(probabilities, dim=1)
+        diagnostics: dict[str, object] = {
+            "acceptance_rate": accepted_tensor.float().mean().item(),
+            "acceptance_rate_by_chain": accepted_tensor.float().mean(dim=1),
+            "acceptance_probability": probability_tensor,
+            "warmup_acceptance_rate": (
+                warmup_accepted / (num_warmup * state.shape[0]) if num_warmup else None
+            ),
+        }
+        return torch.stack(samples, dim=1), diagnostics
 
 
 class UniformRiemannHamiltonian(Hamiltonian):
+    """Canonical Riemannian Hamiltonian for a density-like target function.
+
+    Parameters
+    ----------
+    target : Callable[[Tensor], Tensor]
+        Positive, unnormalized density mapping batched positions to densities.
+    cometric : CoMetric
+        Cometric defining the position-dependent kinetic energy.
+    """
+
     def __init__(self, target: Callable[[Tensor], Tensor], cometric: CoMetric):
         super().__init__()
         self.target = target
@@ -490,9 +461,35 @@ class UniformRiemannHamiltonian(Hamiltonian):
         self.log2pi = torch.log(torch.tensor(2.0 * torch.pi)).item()
 
     def U(self, z: Tensor) -> Tensor:
+        """Return the potential energy induced by the target density.
+
+        Parameters
+        ----------
+        z : Tensor (b, d)
+            Batch of positions.
+
+        Returns
+        -------
+        Tensor (b,)
+            Potential energy ``-log(target(z))`` for each position.
+        """
         return -torch.log(self.target(z))
 
     def K(self, z: Tensor, p: Tensor) -> Tensor:
+        """Return the position-dependent kinetic energy.
+
+        Parameters
+        ----------
+        z : Tensor (b, d)
+            Batch of positions.
+        p : Tensor (b, d)
+            Batch of momenta.
+
+        Returns
+        -------
+        Tensor (b,)
+            Kinetic energy, including the metric-volume normalization term.
+        """
         d = z.shape[1]
         p_Ginv_p = self.cometric.cometric(z, p) ** 2
         log_det_G = -self.cometric.inv_logdet(z)
@@ -521,6 +518,8 @@ class UniformRiemannHamiltonian(Hamiltonian):
 
 
 class VolumeRiemannHamiltonian(UniformRiemannHamiltonian):
+    """Canonical Hamiltonian targeting the cometric volume density."""
+
     def __init__(self, cometric: CoMetric):
         super().__init__(
             target=lambda z: torch.ones(
@@ -529,873 +528,563 @@ class VolumeRiemannHamiltonian(UniformRiemannHamiltonian):
             cometric=cometric,
         )
 
-    # We override the U method to return the volume element of the cometric, which is -0.5 * log(det(G(z)^-1)) = -0.5 * log(det(G(z))) = -0.5 * inv_logdet(G(z))
+    # We override the U method to return the volume element of the cometric, which is -0.5 * log(det(G(z)^-1)) = 0.5 * log(det(G(z))) = -0.5 * inv_logdet(G(z))
     def U(self, z: Tensor) -> Tensor:
+        """Return the potential energy of the cometric volume density.
+
+        Parameters
+        ----------
+        z : Tensor (b, d)
+            Batch of positions.
+
+        Returns
+        -------
+        Tensor (b,)
+            Potential energy induced by the cometric volume element.
+        """
         return -0.5 * self.cometric.inv_logdet(z)
 
 
-class ImplicitMidpointRHMCSampler(Sampler):
-    """
-    Riemannian HMC sampler with the canonical dynamics, integrated with the
-    implicit midpoint scheme.
-    Momentum is drawn from N(0, G(z)) and the trajectory follows the canonical Hamiltonian
-
-        H(z, p) = -log target(z) + 1/2 p^T G(z)^-1 p + 1/2 log det G(z),
-
-    with G(z) an arbitrary position-dependent Riemannian metric (e.g. a
-    SoftAbs metric built from the Hessian of -log target, or the identity for
-    plain HMC). Implicit midpoint applied to this canonical field is
-    symplectic, hence exactly volume preserving (det = 1), so acceptance
-    reduces to the plain energy difference of H: no Jacobian correction is
-    needed.
+class LogTargetRiemannHamiltonian(UniformRiemannHamiltonian):
+    """Canonical Riemannian Hamiltonian for an unnormalized log-density.
 
     Parameters
     ----------
-    target : Callable[[Tensor], Tensor]
-        Unnormalized target density, maps (b, d) positions to (b,) densities.
-        Must be differentiable with torch.
+    log_target : Callable[[Tensor], Tensor]
+        Unnormalized log-density mapping batched positions to log-densities.
     cometric : CoMetric
-        The Riemannian metric G(z) driving the kinetic energy and the
-        momentum distribution.
-    l : int
-        Number of integrator steps per proposal.
-    N_fx : int
-        Maximum number of Picard fixed-point iterations per midpoint step.
-    gamma : float
-        Integrator step size.
-    N_run : int
-        Number of MCMC iterations.
-    pbar : bool
-        If True, shows a progress bar when sampling.
-    skip_acceptance : bool
-        If True, proposals are always accepted (no Metropolis correction).
-    reduced_flip : bool
-        If True, uses the reduced momentum flip (Sohl-Dickstein 2012) on the
-        integration direction upon rejection.
-    H : Hamiltonian | None
-        Optional Hamiltonian override. It must be compatible with the integrator
-        and momentum distribution used by this sampler.
+        Cometric defining the position-dependent kinetic energy.
     """
 
-    def __init__(
-        self,
-        target: Callable[[Tensor], Tensor],
-        cometric: CoMetric,
-        l: int,
-        N_fx: int,
-        gamma: float,
-        N_run: int,
-        pbar: bool = False,
-        skip_acceptance=False,
-        reduced_flip: bool = True,
-        H: Hamiltonian | None = None,
-        compile_step: bool = False,
-    ):
-        super().__init__()
-        self.cometric = cometric
-        self.target = target
-        self.H = H if H is not None else UniformRiemannHamiltonian(target, cometric)
-        self.l = l
-        self.N_fx = N_fx
-        self.gamma = gamma
-        self.N_run = N_run
-        self.pbar = pbar
-        self.skip_acceptance = skip_acceptance
-        self.reduced_flip = reduced_flip
-
-        self.integrator = HamiltonianImplicitMidpointIntegrator(
-            self.H, gamma, N_fx, compile_step=compile_step
+    def __init__(self, log_target: Callable[[Tensor], Tensor], cometric: CoMetric):
+        super().__init__(
+            target=lambda z: torch.ones(z.shape[0], device=z.device),
+            cometric=cometric,
         )
+        self.log_target = log_target
 
-    def sample_momentum(self, z: Tensor) -> Tensor:
-        """Draw p ~ N(0, G(z))."""
-        G = self.cometric.metric_tensor(z)
-        p = torch.randn_like(z)
-        if self.cometric.is_diag:
-            p = p * G.sqrt()
-        else:
-            p = torch.einsum("bij,bi->bj", mat_sqrt(G), p)
-        return p
+    def U(self, z: Tensor) -> Tensor:
+        """Return the potential energy ``-log_target(z)``.
 
-    def proposal_rate(self, x_0: Tensor, x_l: Tensor, log_det: Tensor) -> Tensor:
+        Parameters
+        ----------
+        z : Tensor (b, d)
+            Batch of positions.
+
+        Returns
+        -------
+        Tensor (b,)
+            Potential energy of each position.
         """
-        Metropolis-Hastings acceptance probability of the proposal x_l obtained
-        from x_0 by the implicit midpoint map with log-Jacobian log_det (= 0
-        here, the map is symplectic):
+        return -self.log_target(z)
 
-            alpha = min(1, exp(H(x_0) - H(x_l) + log_det)).
 
-        Shapes: x_0, x_l (b, 2d); log_det (b,); output (b,).
-        """
-        d = x_0.shape[-1] // 2
-        log_alpha = self.H(x_0[:, :d], x_0[:, d:]) - self.H(x_l[:, :d], x_l[:, d:]) + log_det
-        alpha = torch.exp(torch.clamp(log_alpha, max=0.0))
-        return torch.nan_to_num(alpha, nan=0.0)
+class _RHMCSamplerBase(Sampler):
+    """Shared implementation for the public RHMC samplers.
 
-    @torch.no_grad()
-    def sample(
-        self,
-        z_0: Tensor,
-        return_traj: bool = False,
-        progress: bool = False,
-        return_acceptance: bool = False,
-        return_flip: bool = False,
-    ) -> Tensor | tuple[Tensor, float]:
-        """
-        Given an initial sample z_0, it returns a new sample from the target
+    Parameters
+    ----------
+    cometric : CoMetric
+        Cometric defining the position-dependent kinetic energy and momentum
         distribution.
-
-        Parameters
-        ----------
-        z_0 : Tensor (b,d)
-            The initial sample.
-        return_traj : bool
-            If True, return the trajectory, including the initial sample.
-        progress : bool
-            If True, it shows a progress bar when sampling.
-        return_acceptance : bool
-            If True, return the sample or trajectory together with the acceptance rate.
-        return_flip : bool
-            If True, it returns the proportion of direction flips over all steps.
-
-        Returns
-        -------
-        Tensor (b,d) or Tensor (b,N_run+1,d)
-            The new sample, or the trajectory when ``return_traj`` is True.
-        or
-        (Tensor, float)
-            The new sample or trajectory and the acceptance rate when
-            ``return_acceptance`` is True.
-        or
-        The return value does not include the acceptance rate otherwise.
-        """
-        accepted_samples = 0
-        flipped_samples = 0
-        z = z_0.clone()
-        d = z.shape[1]
-        dirs = torch.ones(z.shape[0], device=z_0.device, dtype=z_0.dtype)
-
-        if return_traj:
-            traj = [z.clone()]
-
-        if progress or self.pbar:
-            pbar = tqdm(range(self.N_run), desc="Sampling", unit="steps")
-        else:
-            pbar = range(self.N_run)
-
-        for k in pbar:
-            p_0 = self.sample_momentum(z)
-            x_0 = torch.cat([z, p_0], dim=-1)
-            # A linear-algebra failure is batch-wide and anonymous, so isolate
-            # the offending samples instead of rejecting the whole batch: one
-            # chain that has left the domain must not veto the others.
-            z_l, p_l, log_det, valid = integrate_hamiltonian_isolating_failures(
-                self.integrator, z, p_0, self.l, dirs
-            )
-            x_l = torch.cat([z_l, p_l], dim=-1)
-            alpha = self.proposal_rate(x_0, x_l, log_det)
-            alpha = torch.where(valid, alpha, torch.zeros_like(alpha))
-            z_l = x_l[:, :d]
-
-            if not self.skip_acceptance:
-                u = torch.rand_like(alpha)
-                accept_mask = u < alpha
-                if self.reduced_flip:
-                    rej_idx = (~accept_mask).nonzero(as_tuple=False).squeeze(-1)
-                    if rej_idx.numel() > 0:
-                        # Reduced flip from Sohl-Dickstein (2012)
-                        # applied to the auxiliary integration direction.
-                        # The reverse-direction acceptance is used in place
-                        # of the momentum-flipped proposal in the paper.
-                        # Only computed for rejected samples.
-                        z_l_flip, p_l_flip, log_det_flip, valid_flip = (
-                            integrate_hamiltonian_isolating_failures(
-                                self.integrator,
-                                z[rej_idx],
-                                p_0[rej_idx],
-                                self.l,
-                                -dirs[rej_idx],
-                            )
-                        )
-                        x_l_flip = torch.cat([z_l_flip, p_l_flip], dim=-1)
-                        alpha_flip_rej = self.proposal_rate(
-                            x_0[rej_idx], x_l_flip, log_det_flip
-                        )
-                        alpha_flip_rej = torch.where(
-                            valid_flip, alpha_flip_rej, torch.zeros_like(alpha_flip_rej)
-                        )
-                        alpha_flip = torch.zeros_like(alpha)
-                        alpha_flip[rej_idx] = alpha_flip_rej
-                        p_flip = (alpha_flip - alpha).clamp(min=0)
-                        flip_mask = ~accept_mask & (u < alpha + p_flip)
-                    else:
-                        flip_mask = ~accept_mask  # all False, no rejections
-                else:
-                    flip_mask = ~accept_mask
-                z = torch.where(accept_mask[:, None], z_l, z)
-                dirs = torch.where(flip_mask, -dirs, dirs)
-                accepted_samples += accept_mask.sum().item()
-                flipped_samples += flip_mask.sum().item()
-            else:
-                # Even without the Metropolis correction, never adopt an
-                # invalid state (integration blow-up, or a finite state
-                # outside the region where the metric is defined): the
-                # momentum sampler could not be evaluated there. Such states
-                # are exactly those with alpha = 0 (NaN energies are mapped
-                # to alpha = 0 by proposal_rate).
-                valid_mask = torch.isfinite(z_l).all(dim=-1) & (alpha > 0)
-                z = torch.where(valid_mask[:, None], z_l, z)
-                accepted_samples += z.shape[0]
-
-            if return_traj:
-                traj.append(z.clone())
-
-            if progress or self.pbar:
-                pbar.set_postfix(
-                    {"acceptance_rate": accepted_samples / ((k + 1) * z_0.shape[0])}
-                )
-
-        acceptance_rate = accepted_samples / (self.N_run * z_0.shape[0])
-        flip_rate = flipped_samples / (self.N_run * z_0.shape[0])
-
-        if return_traj:
-            traj = torch.stack(traj, dim=1)
-            if return_acceptance:
-                return (
-                    (traj, acceptance_rate, flip_rate)
-                    if return_flip
-                    else (traj, acceptance_rate)
-                )
-            return (traj, flip_rate) if return_flip else traj
-        if return_acceptance:
-            return (z, acceptance_rate, flip_rate) if return_flip else (z, acceptance_rate)
-        return (z, flip_rate) if return_flip else z
-
-
-class ImplicitRHMCSampler(Sampler):
-    """
-    Riemannian Hamiltonian Monte Carlo sampler with a pdf defined on a manifold.
-    It uses the leapfrog integrator to propose new samples from the target distribution.
-    The leapfrog integrator is solved implicitly.
-    It uses a tempering scheme on the momentum.
-    Here the target distribution is defined by the volume element of the cometric.
-
-    Parameters
-    ----------
-    cometric : CoMetric
-        The cometric that defines the target distribution.
-    l : int
-        The number of leapfrog steps.
-    N_fx : int
-        The number of fixed point iterations.
-    gamma : float
-        The step size.
-    N_run : int
-        The number of iterations.
-    std_0 : float
-        The standard deviation of the initial momentum.
-    bounds : float
-        The bounds of the target distribution. This is because the distribution must be supported on a bounded set.
-    beta_0 : float
-        The initial temperature for the tempering of the momentum.
+    num_integration_steps : int
+        Number of integrator steps used for each proposal.
+    fixed_point_iterations : int
+        Number of fixed-point iterations used by implicit integrators.
+    step_size : float
+        Integrator step size.
+    log_target : Callable[[Tensor], Tensor] | None
+        Unnormalized log-density. If omitted, uses the cometric volume density.
+    momentum_std : float
+        Scale factor for the metric Gaussian momentum.
+    bounds : float | None
+        Optional radial support bound. Proposals outside it are rejected.
     pbar : bool
-        If True, it shows a progress bar.
-    skip_acceptance : bool
-        If True, the acceptance step is skipped. This can be used when differentiabily is needed.
-    threshold_fx : float
-        The threshold for the fixed point iterations. If the maximum change in the fixed point iterations is less than this threshold, the iterations are stopped.
+        If True, display a progress bar while collecting samples.
     H : Hamiltonian | None
-        Optional Hamiltonian override. It must be compatible with the integrator
-        and momentum distribution used by this sampler.
+        Optional compatible Hamiltonian override.
+    compile_step : bool
+        If True, compile the integrator step with ``torch.compile``.
     """
 
     def __init__(
         self,
         cometric: CoMetric,
-        l: int,
-        N_fx: int,
-        gamma: float,
-        N_run: int,
-        std_0: float = 1.0,
-        bounds: float = 1e3,
-        beta_0: float = 1,
+        num_integration_steps: int,
+        fixed_point_iterations: int,
+        step_size: float,
+        log_target: Callable[[Tensor], Tensor] | None = None,
+        momentum_std: float = 1.0,
+        bounds: float | None = None,
         pbar: bool = False,
-        skip_acceptance: bool = False,
-        threshold_fx: float = 1e-5,
         H: Hamiltonian | None = None,
         compile_step: bool = False,
     ):
         super().__init__(pbar)
+        if num_integration_steps < 2:
+            raise ValueError("num_integration_steps must be at least 2.")
+        if fixed_point_iterations < 1:
+            raise ValueError("fixed_point_iterations must be positive.")
+        if step_size <= 0:
+            raise ValueError("step_size must be positive.")
+        if momentum_std <= 0:
+            raise ValueError("momentum_std must be positive.")
         self.cometric = cometric
-        self.l = l
-        self.N_fx = N_fx
-        self.gamma = gamma
-        self.N_run = N_run
-        self.std_0 = std_0
+        self.num_integration_steps = num_integration_steps
+        self.momentum_std = momentum_std
         self.bounds = bounds
-        self.beta_0_sqrt = beta_0**0.5
-        self.skip_acceptance = skip_acceptance
-        self.threshold_fx = threshold_fx
-        self.H = H if H is not None else VolumeRiemannHamiltonian(cometric)
-        self.integrator = ImplicitLeapfrogIntegrator(
-            self.H, gamma, N_fx, compile_step=compile_step
+        if H is not None:
+            self.H = H
+        elif log_target is None:
+            self.H = VolumeRiemannHamiltonian(cometric)
+        else:
+            self.H = LogTargetRiemannHamiltonian(log_target, cometric)
+        self.integrator = None
+
+    def sample_momentum(self, state: Tensor) -> Tensor:
+        """Draw a metric Gaussian momentum for each chain.
+
+        Parameters
+        ----------
+        state : Tensor (num_chains, dimension)
+            Current position of each chain. The metric at these positions
+            determines the momentum covariance.
+
+        Returns
+        -------
+        Tensor (num_chains, dimension)
+            Independently sampled momenta with covariance proportional to the
+            metric tensor at each position.
+        """
+        metric = self.cometric.metric_tensor(state)
+        momentum = torch.randn_like(state)
+        if self.cometric.is_diag:
+            momentum = momentum * metric.sqrt()
+        else:
+            momentum = torch.einsum("bij,bi->bj", mat_sqrt(metric), momentum)
+        return momentum * self.momentum_std
+
+    @torch.no_grad()
+    def step(self, state: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        """Perform one RHMC transition using the subclass integrator.
+
+        Parameters
+        ----------
+        state : Tensor (num_chains, dimension)
+            Current position of each chain.
+
+        Returns
+        -------
+        next_state : Tensor (num_chains, dimension)
+            Position after the Metropolis transition.
+        diagnostics : dict[str, Tensor]
+            Per-chain acceptance indicators and probabilities.
+        """
+        if state.ndim != 2:
+            raise ValueError("state must have shape (num_chains, dimension).")
+
+        momentum = self.sample_momentum(state)
+        proposal_q, proposal_p, log_det, valid = integrate_hamiltonian_isolating_failures(
+            self.integrator,
+            state,
+            momentum,
+            self.num_integration_steps,
+        )
+        log_alpha = self.H(state, momentum) - self.H(proposal_q, proposal_p) + log_det
+
+        acceptance_probability = torch.exp(torch.clamp(log_alpha, max=0.0))
+        acceptance_probability = torch.nan_to_num(acceptance_probability, nan=0.0)
+
+        if self.bounds is not None:
+            acceptance_probability = torch.where(
+                torch.linalg.norm(proposal_q, dim=-1) <= self.bounds,
+                acceptance_probability,
+                torch.zeros_like(acceptance_probability),
+            )
+        acceptance_probability = torch.where(
+            valid, acceptance_probability, torch.zeros_like(acceptance_probability)
         )
 
-    def tempering(self, k) -> float:
-        """
-        Compute the tempering coefficient at step k.
+        accepted = torch.rand_like(acceptance_probability) < acceptance_probability
+        next_state = torch.where(accepted[:, None], proposal_q, state)
 
-        Parameters
-        ----------
-        k : int
-            The current step.
-
-        Returns
-        -------
-        beta_k : float
-            The tempering coefficient at step k.
-        """
-        beta_k = ((1 - 1 / self.beta_0_sqrt) * (k / self.N_run) ** 2) + 1 / self.beta_0_sqrt
-        return beta_k
-
-    def proposal_rate(self, z: Tensor, v: Tensor, z_new: Tensor, v_new: Tensor) -> Tensor:
-        """
-        Compute the proposal rates based on the value of the Hamiltonian.
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The initial position.
-        v : Tensor (b,d)
-            The initial velocity.
-        z_new : Tensor (b,d)
-            The new position.
-        v_new : Tensor (b,d)
-            The new velocity.
-
-        Returns
-        -------
-        Tensor (b,)
-            The proposal rates.
-        """
-        alpha = torch.exp(-self.H(z_new, v_new) + self.H(z, v))
-        return torch.min(torch.ones_like(alpha), alpha)
-
-    def get_alpha(self, z: Tensor, v: Tensor, z_new: Tensor, v_new: Tensor) -> Tensor:
-        """
-        Compute the proposal rates by combining the proposal_rate method and the bounds.
-        If the new sample is out of bounds, the proposal rate is 0.
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The initial position.
-        v : Tensor (b,d)
-            The initial velocity.
-        z_new : Tensor (b,d)
-            The new position.
-        v_new : Tensor (b,d)
-            The new velocity.
-
-        Returns
-        -------
-        Tensor (b,)
-            The proposal rates.
-        """
-        alpha = self.proposal_rate(z, v, z_new, v_new)
-        z_norm = torch.linalg.norm(z_new, dim=-1)
-        out_of_bounds = z_norm > self.bounds
-        alpha[out_of_bounds] = 0
-        return alpha
-
-    def leapfrog(self, z: Tensor, v: Tensor, return_traj: bool = False) -> Tensor:
-        """
-        Perform l leapfrog steps with tempering of the momentum.
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The initial position.
-        v : Tensor (b,d)
-            The initial velocity.
-        return_traj : bool
-            If True, it returns the trajectory of the samples over the l leapfrog steps.
-
-        Returns
-        -------
-        z_new : Tensor (b,d)
-            The new position.
-        v_new : Tensor (b,d)
-            The new velocity.
-        or
-        (Tensor (b,l+1,d), Tensor (b,l+1,d))
-            The trajectory of the positions and velocities over the l leapfrog steps.
-        """
-        z_new, v_new = z.clone(), v.clone()
-        if return_traj:
-            traj_q = [z_new.clone()]
-            traj_p = [v_new.clone()]
-        beta_k_minus_1_sqrt = self.beta_0_sqrt
-        if self.l <= 1:
-            raise ValueError("l must be greater than 1.")
-        for k in range(self.l - 1):
-            z_new, v_new, _ = self.integrator(z_new, v_new, 2)
-            beta_k_sqrt = self.tempering(k)
-            v_new = (beta_k_minus_1_sqrt / beta_k_sqrt) * v_new
-            beta_k_minus_1_sqrt = beta_k_sqrt
-
-            if return_traj:
-                traj_q.append(z_new.clone())
-                traj_p.append(v_new.clone())
-
-        if return_traj:
-            traj_q = torch.stack(traj_q, dim=1)
-            traj_p = torch.stack(traj_p, dim=1)
-            return traj_q, traj_p
-
-        return z_new, v_new
-
-    def sample_momentum(self, z: Tensor) -> Tensor:
-        """
-        Sample the momentum from the Gaussian distribution N(0, g(z))
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        v : Tensor (b,d)
-            The sampled momentum.
-        """
-        g = self.cometric.metric_tensor(z)
-        v = torch.randn_like(z)
-        if self.cometric.is_diag:
-            v = v * g.sqrt() * self.std_0
-        else:
-            v = torch.einsum("bij,bi->bj", mat_sqrt(g), v) * self.std_0
-        return v
+        return next_state, {
+            "accepted": accepted,
+            "acceptance_probability": acceptance_probability,
+            "valid": valid,
+        }
 
     @torch.no_grad()
     def sample(
-        self,
-        z_0: Tensor,
-        return_traj: bool = False,
-        progress: bool = False,
-        return_acceptance: bool = False,
-    ) -> Tensor | tuple[Tensor, float]:
-        """
-        Given an initial sample z_0, it returns a new sample from the target distribution.
+        self, initial_state: Tensor, num_warmup: int, num_samples: int
+    ) -> tuple[Tensor, dict[str, object]]:
+        """Run warmup and collect post-warmup RHMC states.
 
         Parameters
         ----------
-        z_0 : Tensor (b,d)
-            The initial sample.
-        return_traj : bool
-            If True, return the trajectory, including the initial sample.
-        progress : bool
-            If True, it shows a progress bar when sampling.
-        return_acceptance : bool
-            If True, return the sample or trajectory together with the acceptance rate.
+        initial_state : Tensor (num_chains, dimension)
+            Initial position of each chain.
+        num_warmup : int
+            Number of transitions discarded before collection.
+        num_samples : int
+            Number of post-warmup transitions to retain.
 
         Returns
         -------
-        Tensor (b,d) or Tensor (b,N_run+1,d)
-            The new sample, or the trajectory when ``return_traj`` is True.
-        or
-        (Tensor, float)
-            The new sample or trajectory and the acceptance rate when
-            ``return_acceptance`` is True.
-        or
-        The return value does not include the acceptance rate otherwise.
+        samples : Tensor (num_chains, num_samples, dimension)
+            Collected chain states.
+        diagnostics : dict[str, object]
+            Acceptance, validity, and warmup diagnostics.
         """
-        accepted_samples = 0
-        z = z_0.clone()
+        if initial_state.ndim != 2:
+            raise ValueError("initial_state must have shape (num_chains, dimension).")
+        if num_warmup < 0:
+            raise ValueError("num_warmup must be non-negative.")
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive.")
 
-        if return_traj:
-            traj = [z.clone()]
+        state = initial_state.clone()
 
-        if progress:
-            pbar = tqdm(range(self.N_run), desc="Sampling", unit="steps")
-        else:
-            pbar = range(self.N_run)
+        warmup_accepted = 0
+        for _ in range(num_warmup):
+            state, transition = self.step(state)
+            warmup_accepted += transition["accepted"].sum().item()
 
-        for k in pbar:
-            v_0 = self.sample_momentum(z)
-            try:
-                z_l, v_l = self.leapfrog(z, v_0)
-                alpha = self.get_alpha(z, v_0, z_l, v_l)
-            except _LinAlgError:
-                # @TODO: Handle this error properly.
-                # Not the best way to handle this error.
-                # Because a single LinAlgError for a given sample
-                # will stop the whole process even for other valid samples.
-                alpha = torch.zeros(z.shape[0], device=z.device)
-                z_l = z.clone()
+        samples, accepted, probabilities, valid = [], [], [], []
+        flipped = []
+        iterator = (
+            tqdm(range(num_samples), desc="Sampling", unit="draws")
+            if self.pbar
+            else range(num_samples)
+        )
+        for _ in iterator:
+            state, transition = self.step(state)
 
-            if not self.skip_acceptance:
-                u = torch.rand_like(alpha)
-                mask = alpha >= u
-                z = torch.where(mask[:, None], z_l, z)
-                accepted_samples += mask.sum().item()
-            else:
-                z = z_l
-                accepted_samples += z.shape[0]
+            samples.append(state.clone())
+            accepted.append(transition["accepted"])
+            probabilities.append(transition["acceptance_probability"])
+            valid.append(transition["valid"])
 
-            if return_traj:
-                traj.append(z.clone())
+            if "flipped" in transition:
+                flipped.append(transition["flipped"])
 
-            if progress:
-                pbar.set_postfix(
-                    {"acceptance_rate": accepted_samples / ((k + 1) * z_0.shape[0])}
-                )
+        accepted_tensor = torch.stack(accepted, dim=1)
+        diagnostics: dict[str, object] = {
+            "acceptance_rate": accepted_tensor.float().mean().item(),
+            "acceptance_rate_by_chain": accepted_tensor.float().mean(dim=1),
+            "acceptance_probability": torch.stack(probabilities, dim=1),
+            "valid": torch.stack(valid, dim=1),
+            "warmup_acceptance_rate": (
+                warmup_accepted / (num_warmup * state.shape[0]) if num_warmup else None
+            ),
+        }
 
-        acceptance_rate = accepted_samples / (self.N_run * z_0.shape[0])
+        if flipped:
+            diagnostics["flipped"] = torch.stack(flipped, dim=1)
 
-        if return_traj:
-            traj = torch.stack(traj, dim=1)
-            if return_acceptance:
-                return traj, acceptance_rate
-            else:
-                return traj
-        if return_acceptance:
-            return z, acceptance_rate
-        return z
+        return torch.stack(samples, dim=1), diagnostics
 
 
-class ExplicitRHMCSampler(Sampler):
-    """
-    Explicit Riemannian Hamiltonian Monte Carlo sampler with a pdf defined on a manifold.
-    It uses the augmented leapfrog integrator to propose new samples from the target distribution.
-    It uses a tempering scheme on the momentum.
-    Here the target distribution is defined by the volume element of the cometric.
-    But this class is easily heritable to define other target distributions. Just redefine
-    the p_target method.
+class ImplicitMidpointRHMCSampler(_RHMCSamplerBase):
+    """Riemannian HMC using the implicit midpoint integrator.
 
-    `Introducing an Explicit Symplectic Integration Scheme for Riemannian Manifold Hamiltonian Monte Carlo`
-    by Cobb et Baydin et al (2019).
+    The midpoint integrator is symmetric and volume-preserving for the
+    canonical Hamiltonian dynamics.
 
-    Parameters
-    ----------
-    cometric : CoMetric
-        The cometric that defines the target distribution.
-    l : int
-        The number of leapfrog steps.
-    gamma : float
-        The step size.
-    omega : float
-        The binding parameter
-    N_run : int
-        The number of iterations.
-    std_0 : float
-        The standard deviation of the initial momentum.
-    bounds : float
-        The bounds of the target distribution. This is because the distribution must be supported on a bounded set.
-    beta_0 : float
-        The initial temperature for the tempering of the momentum.
-    pbar : bool
-        If True, it shows a progress bar.
-    skip_acceptance : bool
-        If True, the acceptance step is skipped. This can be used when differentiabily is needed.
-    H : Hamiltonian | None
-        Optional Hamiltonian override. It must be compatible with the integrator
-        and momentum distribution used by this sampler.
+    ``compile_step`` is forwarded to the integrator and can be used to
+    compile its step function with ``torch.compile``.
     """
 
     def __init__(
         self,
         cometric: CoMetric,
-        l: int,
-        gamma: float,
-        omega: float,
-        N_run: int,
-        bounds: float = 1e3,
-        std_0: float = 1.0,
-        beta_0: float = 1,
+        num_integration_steps: int,
+        fixed_point_iterations: int,
+        step_size: float,
+        log_target: Callable[[Tensor], Tensor] | None = None,
+        momentum_std: float = 1.0,
+        bounds: float | None = None,
         pbar: bool = False,
-        skip_acceptance: bool = False,
         H: Hamiltonian | None = None,
         compile_step: bool = False,
     ):
-        super().__init__(pbar)
-        self.cometric = cometric
-        self.l = l
-        self.gamma = gamma
-        self.omega = omega
-        self.N_run = N_run
-        self.std_0 = std_0
-        self.bounds = bounds
-        self.beta_0_sqrt = beta_0**0.5
-        self.skip_acceptance = skip_acceptance
-
-        c = torch.Tensor([2 * self.omega * self.gamma]).cos()
-        s = torch.Tensor([2 * self.omega * self.gamma]).sin()
-        self.register_buffer("c", c, persistent=False)
-        self.register_buffer("s", s, persistent=False)
-
-        self.H = H if H is not None else VolumeRiemannHamiltonian(cometric)
-        self.integrator = ExplicitLeapfrogIntegrator(
-            self.H, gamma, omega, compile_step=compile_step
+        super().__init__(
+            cometric,
+            num_integration_steps,
+            fixed_point_iterations,
+            step_size,
+            log_target,
+            momentum_std,
+            bounds,
+            pbar,
+            H,
+            compile_step,
+        )
+        self.integrator = HamiltonianImplicitMidpointIntegrator(
+            self.H, step_size, fixed_point_iterations, compile_step=compile_step
         )
 
-    def tempering(self, k) -> float:
-        """
-        Compute the tempering coefficient at step k.
 
-        Parameters
-        ----------
-        k : int
-            The current step.
+class ImplicitLeapfrogRHMCSampler(_RHMCSamplerBase):
+    """Riemannian HMC using the implicit leapfrog integrator.
 
-        Returns
-        -------
-        beta_k : float
-            The tempering coefficient at step k.
-        """
-        beta_k = ((1 - 1 / self.beta_0_sqrt) * (k / self.N_run) ** 2) + 1 / self.beta_0_sqrt
-        return beta_k
+    The position-dependent kinetic energy is handled through implicit
+    fixed-point updates.
 
-    def proposal_rate(
+    ``compile_step`` is forwarded to the integrator and can be used to
+    compile its step function with ``torch.compile``.
+    """
+
+    def __init__(
         self,
-        z_l_0: Tensor,
-        v_l_0: Tensor,
-        z_0: Tensor,
-        v0: Tensor,
-    ) -> Tensor:
-        """
-        Compute the proposal rates based on the value of the Hamiltonian.
+        cometric: CoMetric,
+        num_integration_steps: int,
+        fixed_point_iterations: int,
+        step_size: float,
+        log_target: Callable[[Tensor], Tensor] | None = None,
+        momentum_std: float = 1.0,
+        bounds: float | None = None,
+        pbar: bool = False,
+        H: Hamiltonian | None = None,
+        compile_step: bool = False,
+    ):
+        super().__init__(
+            cometric,
+            num_integration_steps,
+            fixed_point_iterations,
+            step_size,
+            log_target,
+            momentum_std,
+            bounds,
+            pbar,
+            H,
+            compile_step,
+        )
+        self.integrator = ImplicitLeapfrogIntegrator(
+            self.H, step_size, fixed_point_iterations, compile_step=compile_step
+        )
 
-        Parameters
-        ----------
-        z_l_0 : Tensor (b,d)
-            The new position of the first state.
-        v_l_0 : Tensor (b,d)
-            The new velocity of the first state.
-        z_0 : Tensor (b,d)
-            The initial position of the first state.
-        v0 : Tensor (b,d)
-            The initial velocity of the first state.
 
-        Returns
-        -------
-        Tensor (b,)
-            The proposal rates.
-        """
-        H_new = self.H(z_l_0, v_l_0)
-        H_old = self.H(z_0, v0)
-        alpha = torch.exp(-H_new + H_old)
-        return torch.min(torch.ones_like(alpha), alpha)
+class ExplicitRHMCSampler(_RHMCSamplerBase):
+    """RHMC using the explicit augmented leapfrog integrator.
 
-    def get_alpha(
+    The auxiliary copy is initialized from the current chain state for every
+    transition and is not carried between transitions.
+
+    ``compile_step`` is forwarded to the integrator and can be used to
+    compile its step function with ``torch.compile``.
+
+    Parameters
+    ----------
+    omega : float
+        Binding frequency for the augmented two-copy dynamics.
+    """
+
+    def __init__(
         self,
-        z_l_0: Tensor,
-        v_l_0: Tensor,
-        z_l_1: Tensor,
-        z_0: Tensor,
-        v0: Tensor,
-    ) -> Tensor:
-        """
-        Compute the proposal rates by combining the proposal_rate method and the bounds.
-        If the new sample is out of bounds, the proposal rate is 0.
+        cometric: CoMetric,
+        num_integration_steps: int,
+        step_size: float,
+        omega: float,
+        fixed_point_iterations: int=1,
+        log_target: Callable[[Tensor], Tensor] | None = None,
+        momentum_std: float = 1.0,
+        bounds: float | None = None,
+        pbar: bool = False,
+        H: Hamiltonian | None = None,
+        compile_step: bool = False,
+    ):
+        super().__init__(
+            cometric,
+            num_integration_steps,
+            fixed_point_iterations,
+            step_size,
+            log_target,
+            momentum_std,
+            bounds,
+            pbar,
+            H,
+            compile_step,
+        )
+        self.integrator = ExplicitLeapfrogIntegrator(
+            self.H, step_size, omega, compile_step=compile_step
+        )
+
+
+class _ReducedFlipRHMCMixin:
+    """
+    Base class for RHMC samplers with persistent signed directions and reduced-flip transitions.
+    Idea from Sohl-Dickstein (2012): when a proposal is rejected, evaluate the proposal in
+    the reverse direction and flip the direction for the next transition with
+    probability proportional to the difference in acceptance probabilities.
+    The reverse-direction acceptance is used in place of the momentum-flipped proposal
+    in the paper. Only computed for rejected samples.
+    """
+
+    _directions: Tensor | None = None
+
+    @torch.no_grad()
+    def step(self, state: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        """Perform one reduced-flip RHMC transition.
 
         Parameters
         ----------
-        z_l_0 : Tensor (b,d)
-            The new position of the first state.
-        v_l_0 : Tensor (b,d)
-            The new velocity of the first state.
-        z_l_1 : Tensor (b,d)
-            The new position of the second state.
-        z_0 : Tensor (b,d)
-            The initial position of the first state.
-        v0 : Tensor (b,d)
-            The initial velocity of the first state.
+        state : Tensor (num_chains, dimension)
+            Current position of each chain.
 
         Returns
         -------
-        Tensor (b,)
-            The proposal rates.
+        next_state : Tensor (num_chains, dimension)
+            Position after the reduced-flip Metropolis transition.
+        diagnostics : dict[str, Tensor]
+            Per-chain acceptance, reverse-acceptance, validity, and direction
+            flip indicators.
         """
-        alpha = self.proposal_rate(z_l_0, v_l_0, z_0, v0)
-        if self.bounds is not None:
-            z_0_norm = torch.linalg.norm(z_l_0, dim=-1)
-            z_1_norm = torch.linalg.norm(z_l_1, dim=-1)
-            z_norm = torch.max(z_0_norm, z_1_norm)
-            out_of_bounds = z_norm > self.bounds
-            alpha[out_of_bounds] = 0
-        return alpha
-
-    def leapfrog(
-        self, z_0: Tensor, v0: Tensor, z_1: Tensor, v1: Tensor, return_traj: bool = False
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """
-        Perform l leapfrog steps with tempering of the momentum.
-
-        Parameters
-        ----------
-        z_0 : Tensor (b,d)
-            The initial position of the first state.
-        v0 : Tensor (b,d)
-            The initial velocity of the first state.
-        z_1 : Tensor (b,d)
-            The initial position of the second state.
-        v1 : Tensor (b,d)
-            The initial velocity of the second state.
-        return_traj : bool
-            If True, it returns the trajectory of the samples over the l leapfrog steps.
-
-        Returns
-        -------
-        z_l_0 : Tensor (b,d)
-            The new position of the first state.
-        v_l_0 : Tensor (b,d)
-            The new velocity of the first state.
-        z_l_1 : Tensor (b,d)
-            The new position of the second state.
-        v_l_1 : Tensor (b,d)
-            The new velocity of the second state.
-        or
-        (Tensor (b,l+1,d), Tensor (b,l+1,d), Tensor (b,l+1,d), Tensor (b,l+1,d))
-            The trajectory of the positions and velocities over the l leapfrog steps.
-        """
-        z_l_0, v_l_0, z_l_1, v_l_1 = z_0.clone(), v0.clone(), z_1.clone(), v1.clone()
-        if return_traj:
-            traj_q_0 = [z_l_0.clone()]
-            traj_p_0 = [v_l_0.clone()]
-            traj_q_1 = [z_l_1.clone()]
-            traj_p_1 = [v_l_1.clone()]
-        beta_k_minus_1_sqrt = self.beta_0_sqrt
-        if self.l <= 1:
-            raise ValueError("l must be greater than 1.")
-        for k in range(self.l - 1):
-            z_l_0, v_l_0, z_l_1, v_l_1, _ = self.integrator.forward_augmented(
-                z_l_0,
-                v_l_0,
-                2,
-                q_1=z_l_1,
-                p_1=v_l_1,
+        if state.ndim != 2:
+            raise ValueError("state must have shape (num_chains, dimension).")
+        if self._directions is None or self._directions.shape[0] != state.shape[0]:
+            self._directions = torch.ones(
+                state.shape[0], device=state.device, dtype=state.dtype
             )
-            beta_k_sqrt = self.tempering(k)
-            v_l_0 = (beta_k_minus_1_sqrt / beta_k_sqrt) * v_l_0
-            v_l_1 = (beta_k_minus_1_sqrt / beta_k_sqrt) * v_l_1
-            beta_k_minus_1_sqrt = beta_k_sqrt
+        directions = self._directions.to(device=state.device, dtype=state.dtype)
 
-            if return_traj:
-                traj_q_0.append(z_l_0.clone())
-                traj_p_0.append(v_l_0.clone())
-                traj_q_1.append(z_l_1.clone())
-                traj_p_1.append(v_l_1.clone())
+        momentum = self.sample_momentum(state)
+        initial = torch.cat([state, momentum], dim=-1)
 
-        if return_traj:
-            traj_q_0 = torch.stack(traj_q_0, dim=1)
-            traj_p_0 = torch.stack(traj_p_0, dim=1)
-            traj_q_1 = torch.stack(traj_q_1, dim=1)
-            traj_p_1 = torch.stack(traj_p_1, dim=1)
-            return traj_q_0, traj_p_0, traj_q_1, traj_p_1
+        proposal_q, proposal_p, log_det, valid = integrate_hamiltonian_isolating_failures(
+            self.integrator,
+            state,
+            momentum,
+            self.num_integration_steps,
+            directions,
+        )
+        proposal = torch.cat([proposal_q, proposal_p], dim=-1)
+        alpha = self._rf_alpha(initial, proposal, log_det, valid, proposal_q)
+        uniform = torch.rand_like(alpha)
+        accepted = uniform < alpha
 
-        return z_l_0, v_l_0, z_l_1, v_l_1
-
-    def sample_momentum(self, z: Tensor) -> Tensor:
-        """
-        Sample the momentum from the Gaussian distribution N(0, g(z))
-
-        Parameters
-        ----------
-        z : Tensor (b,d)
-            The position.
-
-        Returns
-        -------
-        v : Tensor (b,d)
-            The sampled momentum.
-        """
-        g = self.cometric.metric_tensor(z)
-        v = torch.randn_like(z)
-        if self.cometric.is_diag:
-            v = v * g.sqrt() * self.std_0
-        else:
-            v = torch.einsum("bij,bi->bj", mat_sqrt(g), v) * self.std_0
-        return v
-
-    def sample(
-        self,
-        z_0: Tensor,
-        return_traj: bool = False,
-        progress: bool = False,
-        return_acceptance: bool = False,
-    ) -> Tensor | tuple[Tensor, float]:
-        """
-        Given an initial sample z_0, it returns a new sample from the target distribution.
-
-        Parameters
-        ----------
-        z_0 : Tensor (b,d)
-            The initial sample.
-        return_traj : bool
-            If True, return the trajectory, including the initial sample.
-        progress : bool
-            If True, it shows a progress bar when sampling.
-        return_acceptance : bool
-            If True, return the sample or trajectory together with the acceptance rate.
-
-        Returns
-        -------
-        Tensor (b,d) or Tensor (b,N_run+1,d)
-            The new sample, or the trajectory when ``return_traj`` is True.
-        or
-        (Tensor, float)
-            The new sample or trajectory and the acceptance rate when
-            ``return_acceptance`` is True.
-        or
-        The return value does not include the acceptance rate otherwise.
-        """
-        accepted_samples = 0
-        z_0 = z_0.clone()
-        z_1 = z_0.clone()
-
-        if return_traj:
-            traj = [z_0.clone()]
-
-        if progress:
-            pbar = tqdm(range(self.N_run), desc="Sampling", unit="steps")
-        else:
-            pbar = range(self.N_run)
-
-        for k in pbar:
-            v_0 = self.sample_momentum(z_0)
-            v_1 = v_0.clone()
-
-            z_l_0, v_l_0, z_l_1, v_l_1 = self.leapfrog(z_0, v_0, z_1, v_1)
-
-            if not self.skip_acceptance:
-                alpha = self.get_alpha(z_l_0, v_l_0, z_l_1, z_0, v_0)
-
-                u = torch.rand_like(alpha)
-                mask = alpha >= u
-                z_0 = torch.where(mask[:, None], z_l_0, z_0)
-                z_1 = torch.where(mask[:, None], z_l_1, z_1)
-                accepted_samples += mask.sum().item()
-            else:
-                z_0 = z_l_0
-                z_1 = z_l_1
-                accepted_samples += z_0.shape[0]
-
-            if return_traj:
-                traj.append(z_0.clone())
-            if progress:
-                pbar.set_postfix(
-                    {"acceptance_rate": accepted_samples / ((k + 1) * z_0.shape[0])}
+        flipped = torch.zeros_like(accepted)
+        reverse_alpha = torch.zeros_like(alpha)
+        rejected_indices = (~accepted).nonzero(as_tuple=False).squeeze(-1)
+        if rejected_indices.numel() > 0:
+            reverse_q, reverse_p, reverse_log_det, reverse_valid = (
+                integrate_hamiltonian_isolating_failures(
+                    self.integrator,
+                    state[rejected_indices],
+                    momentum[rejected_indices],
+                    self.num_integration_steps,
+                    -directions[rejected_indices],
                 )
+            )
+            reverse_proposal = torch.cat([reverse_q, reverse_p], dim=-1)
+            reverse_alpha[rejected_indices] = self._rf_alpha(
+                initial[rejected_indices],
+                reverse_proposal,
+                reverse_log_det,
+                reverse_valid,
+                reverse_q,
+            )
+            flip_probability = (
+                reverse_alpha[rejected_indices] - alpha[rejected_indices]
+            ).clamp(min=0)
+            flipped[rejected_indices] = uniform[rejected_indices] < (
+                alpha[rejected_indices] + flip_probability
+            )
 
-        acceptance_rate = accepted_samples / (self.N_run * z_0.shape[0])
+        self._directions = torch.where(flipped, -directions, directions)
 
-        if return_traj:
-            traj = torch.stack(traj, dim=1)
-            if return_acceptance:
-                return traj, acceptance_rate
-            else:
-                return traj
-        if return_acceptance:
-            return z_0, acceptance_rate
-        return z_0
+        return torch.where(accepted[:, None], proposal_q, state), {
+            "accepted": accepted,
+            "acceptance_probability": alpha,
+            "reverse_acceptance_probability": reverse_alpha,
+            "flipped": flipped,
+            "valid": valid,
+        }
+
+    def _rf_alpha(
+        self,
+        initial: Tensor,
+        proposal: Tensor,
+        log_det: Tensor,
+        valid: Tensor,
+        proposal_q: Tensor,
+    ) -> Tensor:
+        """Compute reduced-flip acceptance probabilities.
+
+        Parameters
+        ----------
+        initial : Tensor (num_chains, 2 * dimension)
+            Concatenated initial positions and momenta.
+        proposal : Tensor (num_chains, 2 * dimension)
+            Concatenated proposed positions and momenta.
+        log_det : Tensor (num_chains,)
+            Log-Jacobians of the proposal transformation.
+        valid : Tensor (num_chains,) bool
+            Mask identifying proposals produced by valid integrations.
+        proposal_q : Tensor (num_chains, dimension)
+            Proposed positions, used for support-bound checks.
+
+        Returns
+        -------
+        Tensor (num_chains,)
+            Per-chain acceptance probabilities in the interval ``[0, 1]``.
+        """
+        dimension = proposal_q.shape[1]
+        log_alpha = (
+            self.H(initial[:, :dimension], initial[:, dimension:])
+            - self.H(proposal[:, :dimension], proposal[:, dimension:])
+            + log_det
+        )
+        alpha = torch.nan_to_num(torch.exp(torch.clamp(log_alpha, max=0.0)), nan=0.0)
+
+        if self.bounds is not None:
+            alpha = torch.where(
+                torch.linalg.norm(proposal_q, dim=-1) <= self.bounds,
+                alpha,
+                torch.zeros_like(alpha),
+            )
+
+        return torch.where(valid, alpha, torch.zeros_like(alpha))
+
+    @torch.no_grad()
+    def sample(
+        self, initial_state: Tensor, num_warmup: int, num_samples: int
+    ) -> tuple[Tensor, dict[str, object]]:
+        """Run warmup and collect reduced-flip RHMC states.
+
+        Parameters
+        ----------
+        initial_state : Tensor (num_chains, dimension)
+            Initial position of each chain.
+        num_warmup : int
+            Number of transitions discarded before collection.
+        num_samples : int
+            Number of post-warmup transitions to retain.
+
+        Returns
+        -------
+        samples : Tensor (num_chains, num_samples, dimension)
+            Collected chain states.
+        diagnostics : dict[str, object]
+            Standard RHMC diagnostics plus aggregate and per-chain direction
+            flip rates.
+        """
+        self._directions = None
+        samples, diagnostics = super().sample(initial_state, num_warmup, num_samples)
+        flipped = diagnostics["flipped"]
+        assert isinstance(flipped, Tensor)
+        diagnostics["flip_rate"] = flipped.float().mean().item()
+        diagnostics["flip_rate_by_chain"] = flipped.float().mean(dim=1)
+        return samples, diagnostics
+
+
+class ImplicitLeapfrogRHMCRFSampler(_ReducedFlipRHMCMixin, ImplicitLeapfrogRHMCSampler):
+    """Implicit-leapfrog RHMC with reduced-flip direction persistence."""
+
+
+class ImplicitMidpointRHMCRFSampler(_ReducedFlipRHMCMixin, ImplicitMidpointRHMCSampler):
+    """Implicit-midpoint RHMC with reduced-flip direction persistence."""
+
+
+class ExplicitRHMCRFSampler(_ReducedFlipRHMCMixin, ExplicitRHMCSampler):
+    """Explicit augmented RHMC with reduced-flip direction persistence."""
