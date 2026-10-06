@@ -2730,10 +2730,27 @@ class SlopeMetrics(FinslerMetric):
         super(SlopeMetrics, self).__init__()
         self.f = f
         self.f_no_batch = lambda x: self.f(x.unsqueeze(0)).squeeze(0)
-        self.df_ = torch.vmap(torch.func.jacrev(self.f_no_batch))
 
+    def df_(self, x: Tensor) -> Tensor:
+        """
+        Computes the gradient of the height map f at points x.
+
+        Parameters:
+        -----------
+        x : Tensor (b,2)
+            Points in the manifold
+
+        Returns:
+        -------
+        df : Tensor (b,2)
+            Gradient of f at points x
+        """
+        f_x = self.f(x)
+        df = torch.autograd.grad(f_x.sum(), x, create_graph=True)[0]
+        return df
+    
     def forward(self, x: Tensor, v: Tensor) -> Tensor:
-        df = self.df_(x)
+        df = self.df_(x)        
         df_dx, df_dy = df[:, 0], df[:, 1]
 
         alpha = (

@@ -317,6 +317,9 @@ def get_mf_image(
     if embeddings is not None:
         device = embeddings.device
         dtype = embeddings.dtype
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.float32
 
     x_plot = torch.linspace(min_x, max_x, resolution, device=device, dtype=dtype)
     y_plot = torch.linspace(min_y, max_y, resolution, device=device, dtype=dtype)
