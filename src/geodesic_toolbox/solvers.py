@@ -1,40 +1,47 @@
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from itertools import product
+from math import ceil
+
+import networkx as nx
 import numpy as np
 import torch
-from torch import Tensor
-from math import ceil
-from dataclasses import dataclass, field
+import torchcurves.functional as tcf
 from einops import rearrange
-from collections.abc import Callable
+from networkx import (
+    DiGraph,
+    Graph,
+    is_connected,
+)
 from scipy.integrate import solve_bvp
-from itertools import product
-
-from sklearn.neighbors import NearestNeighbors
+from scipy.interpolate import CubicSpline
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import shortest_path
-from scipy.interpolate import CubicSpline
-from networkx import Graph, DiGraph, is_connected, is_strongly_connected, is_weakly_connected
-import networkx as nx
-import torchcurves.functional as tcf
+from sklearn.neighbors import NearestNeighbors
+from torch import Tensor
+from torchdiffeq import odeint
+from tqdm import tqdm
 
 from .cometric import (
     CoMetric,
-    IdentityCoMetric,
-    FinslerMetric,
-    RandersMetrics,
     DualRandersMetrics,
+    FinslerMetric,
+    IdentityCoMetric,
+    RandersMetrics,
 )
-from .integrators import ExplicitLeapfrogIntegrator, ImplicitLeapfrogIntegrator, HamiltonianEulerIntegrator
+from .integrators import (
+    ExplicitLeapfrogIntegrator,
+    HamiltonianEulerIntegrator,
+    ImplicitLeapfrogIntegrator,
+)
 from .utils import (
-    magnification_factor,
+    batched_kro,
     # hamiltonian,
     cosine_time_scaling_schedule,
+    magnification_factor,
     scale_lr_magnification,
     vec,
-    batched_kro,
 )
-
-from tqdm import tqdm
-from torchdiffeq import odeint
 
 
 def _get_padded_neighbor_indices(
@@ -134,7 +141,6 @@ class GeodesicDistanceSolver(torch.nn.Module):
         Output:
         traj_q : Tensor (b,n_pts,dim), points on the trajectory
         """
-        pass
 
     def compute_energy(self, traj_q: Tensor, use_midpoints: bool = True) -> Tensor:
         """Given the trajectory, computes its energy according to the metric
@@ -246,7 +252,7 @@ class ShootingSolver(GeodesicDistanceSolver):
         n_step: int = 100,
         dt: float = 0.01,
         method: str = "euler",
-        convergence_threshold: float = None,
+        convergence_threshold: float | None = None,
         time_scaling_schedule: Callable[[float], float] = cosine_time_scaling_schedule,
         scale_lr: bool = True,
         verbose: bool = False,
@@ -601,7 +607,7 @@ class BVP_wrapper(GeodesicDistanceSolver):
     """
 
     def __init__(self, cometric: CoMetric, T: int = 100, dim: int = 2, verbose=0):
-        super(BVP_wrapper, self).__init__(cometric)
+        super().__init__(cometric)
         self.T = T
         self.dim = dim
         self.verbose = verbose
@@ -621,7 +627,6 @@ class BVP_wrapper(GeodesicDistanceSolver):
         f_t : np.ndarray (2*dim, m)
             right-hand side of the ODE
         """
-        pass
 
     def bc_(
         self,
@@ -699,7 +704,6 @@ class BVP_wrapper(GeodesicDistanceSolver):
         state : BVPResult
             solution of the BVP
         """
-        pass
 
     def get_trajectories(self, start_pts: Tensor, end_pts: Tensor, init_traj=None) -> Tensor:
         """
@@ -1308,7 +1312,7 @@ class SolverGraph(GeodesicDistanceSolver):
         # Construct CSR matrix explicitly with these edges
         W_csr = csr_matrix((weights, (rows, cols)), shape=W.shape)
 
-        dst_matrix, predecessors = shortest_path(
+        _dst_matrix, predecessors = shortest_path(
             W_csr,
             directed=False,
             return_predecessors=True,
@@ -2073,7 +2077,7 @@ class SolverGraphFinsler(torch.nn.Module):
         # Construct CSR matrix explicitly with these edges
         W_csr = csr_matrix((weights, (rows, cols)), shape=W.shape)
 
-        dst_matrix, predecessors = shortest_path(
+        _dst_matrix, predecessors = shortest_path(
             W_csr,
             directed=True,
             return_predecessors=True,
@@ -3309,7 +3313,7 @@ class GEORCEFinsler(torch.nn.Module):
             0
         ]  # (T-1, d)
         norm_grad_E_t = self._energy_grad_norm(grad_E_t)
-        norm_grad_E_before = norm_grad_E_t.clone()
+        # norm_grad_E_before = norm_grad_E_t.clone()
 
         with torch.no_grad():
             initial_distance = self.dst_func(x_0, x_T, x_t_i).item()
@@ -3327,7 +3331,7 @@ class GEORCEFinsler(torch.nn.Module):
 
         # while (norm_grad_E_t > self.tol) and (i < self.max_iter) and (norm_grad_E_t / (norm_grad_E_before + 1e-8) > 1e-3):
         while not self.main_stop_cond(norm_grad_E_t, i):
-            norm_grad_E_before = norm_grad_E_t.clone()
+            # norm_grad_E_before = norm_grad_E_t.clone()
 
             # L5
             G_t = self.finsler.fundamental_tensor(x_t_i, u_t_i[1:])  # (T-2, d, d)
@@ -4647,9 +4651,9 @@ class ExpMapFinsler(torch.nn.Module):
         B, d = x_0.shape
         assert v_0.shape == (B, d), f"Both tensors must have the same shape {(B, d)=}"
         for b in range(B):
-            x_t, v_t = self.geodesic_shooting(x_0[b], v_0[b])
+            x_t, _v_t = self.geodesic_shooting(x_0[b], v_0[b])
             trajectories.append(x_t)
-        if len(set([traj.shape[0] for traj in trajectories])) == 1:
+        if len({traj.shape[0] for traj in trajectories}) == 1:
             trajectories = torch.stack(trajectories, dim=0)  # (B, T, d)
         return trajectories
 

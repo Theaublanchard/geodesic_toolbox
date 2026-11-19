@@ -7,10 +7,11 @@ Then we focus on the case of Hamiltonian dynamics, where
 with J the symplectic matrix and H the Hamiltonian function.
 """
 
+from collections.abc import Callable
+
 import torch
 from torch import Tensor
 from tqdm import tqdm
-from typing import Callable
 
 ##############################
 # General integrators for ODEs of the form dx/dt = f(x)

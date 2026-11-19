@@ -1,6 +1,6 @@
-import pytest
-from geodesic_toolbox import cometric
 import torch
+
+from geodesic_toolbox import cometric
 
 
 ############################################################
@@ -12,7 +12,7 @@ class DummyAccuracyPredictor(torch.nn.Module):
     """
 
     def __init__(self):
-        super(DummyAccuracyPredictor, self).__init__()
+        super().__init__()
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return torch.ones(z.shape[0], 1, device=z.device)
@@ -24,7 +24,7 @@ class DummyDirectionPredictor(torch.nn.Module):
     """
 
     def __init__(self, dim: int):
-        super(DummyDirectionPredictor, self).__init__()
+        super().__init__()
         self.dim = dim
         self.rand_dir = torch.randn(dim)
 

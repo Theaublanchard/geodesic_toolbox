@@ -1,12 +1,12 @@
-import torch
-from torch import Tensor
-import torch.nn as nn
 import weakref
-import numpy as np
-from tqdm import tqdm
-import kmedoids
-from einops import rearrange
 from typing import Self
+
+import kmedoids
+import numpy as np
+import torch
+from einops import rearrange
+from torch import Tensor, nn
+from tqdm import tqdm
 
 ################################################################
 # Utils
@@ -67,31 +67,9 @@ def empirical_diag_cov_mat(x: Tensor, mu: Tensor = None, eps: float = 1e-6) -> T
     cov = (var + eps) * torch.eye(x.shape[1], device=x.device)
     return cov
 
-
-def mat_sqrt(A: Tensor) -> Tensor:
-    """
-    Compute the matrix square root of a positive definite matrix A.
-
-    Parameters
-    ----------
-    A : Tensor (..., n, n)
-        The matrix to compute the square root of.
-
-    Returns
-    -------
-    Tensor (..., n, n)
-        The matrix square root of A.
-    """
-    L, Q = torch.linalg.eigh(A)
-    zero = torch.zeros((), device=L.device, dtype=L.dtype)
-    threshold = L.max(-1).values * L.size(-1) * torch.finfo(L.dtype).eps
-    L = L.where(L > threshold.unsqueeze(-1), zero)  # zero out small components
-    return (Q * L.sqrt().unsqueeze(-2)) @ Q.mH
-
-
 # def SoftAbs(M: Tensor, alpha: float = 1e3) -> Tensor:
 #     """
-#     SoftAbs regularisation of a matrix M. It is used to ensure that the matrix is positive definite.
+#     SoftAbs regularization of a matrix M. It is used to ensure that the matrix is positive definite.
 #     This is especially useful when using the Fisher information matrix.
 #     Essentially, it is a soft version of the absolute value.
 
@@ -108,14 +86,14 @@ def mat_sqrt(A: Tensor) -> Tensor:
 #     Parameters
 #     ----------
 #     M : Tensor (..., n, n)
-#         The matrix to regularise.
+#         The matrix to regularize.
 #     alpha : float
-#         The regularisation parameter.
+#         The regularization parameter.
 
 #     Returns
 #     -------
 #     Tensor (..., n, n)
-#         The regularised matrix.
+#         The regularized matrix.
 #     """
 #     D, Q = torch.linalg.eigh(M)
 #     D = D * 1 / torch.tanh(alpha * D)
@@ -430,13 +408,13 @@ class CoMetric(torch.nn.Module):
         if isinstance(other, CoMetric):
             return SumOfCometric(self, other)
         else:
-            raise ValueError(f"Cannot add {type(other)} to CoMetric")
+            raise TypeError(f"Cannot add {type(other)} to CoMetric")
 
     def __mul__(self, other: object) -> Self:
         if isinstance(other, (int, float)):
             return ScaledCometric(self, other)
         else:
-            raise ValueError(f"Cannot multiply {type(other)} to CoMetric")
+            raise TypeError(f"Cannot multiply {type(other)} to CoMetric")
 
     def __rmul__(self, other: object) -> Self:
         return self.__mul__(other)
@@ -635,10 +613,10 @@ def mat_sqrt(A: Tensor) -> Tensor:
 
 def _softabs_g(lam: Tensor, alpha: float) -> Tensor:
     """
-    Compute the SoftAbs regularisation function for a
-    batch of eigenvalues lam and a regularisation parameter alpha.
+    Compute the SoftAbs regularization function for a
+    batch of eigenvalues lam and a regularization parameter alpha.
     The eigendecomposition is expected to be of the METRIC tensor.
-    So that this function output the regularised eigenvalues
+    So that this function output the regularized eigenvalues
     of the COMETRIC tensor as:
         reg_eigenvalue = 1/lam * tanh(alpha*lam)
 
@@ -649,12 +627,12 @@ def _softabs_g(lam: Tensor, alpha: float) -> Tensor:
     lam : Tensor (b, n)
         Eigenvalues of the metric tensor
     alpha : float
-        Regularisation parameter for the SoftAbs
+        Regularization parameter for the SoftAbs
 
     Returns
     -------
     Tensor (b, n)
-        Regularised eigenvalues of the cometric tensor
+        Regularized eigenvalues of the cometric tensor
     """
     alpha = float(alpha)
     u = alpha * lam
@@ -680,12 +658,12 @@ def _softabs_dg(lam: Tensor, alpha: float) -> Tensor:
     lam : Tensor (b, n)
         Eigenvalues of the cometric tensor
     alpha : float
-        Regularisation parameter for the SoftAbs
+        Regularization parameter for the SoftAbs
 
     Returns
     -------
     Tensor (b, n)
-        Derivative of the SoftAbs regularisation function with respect to lam
+        Derivative of the SoftAbs regularization function with respect to lam
     """
     alpha = float(alpha)
     u = alpha * lam
@@ -715,7 +693,7 @@ def _softabs_d2g(lam: Tensor, alpha: float) -> Tensor:
     lam : Tensor (b, n)
         Eigenvalues of the cometric tensor
     alpha : float
-        Regularisation parameter for the SoftAbs
+        regularization parameter for the SoftAbs
     """
     alpha = float(alpha)
     u = alpha * lam
@@ -748,7 +726,7 @@ def _softabs_gamma(lam: Tensor, alpha: float) -> Tensor:
     lam : Tensor (b, n)
         Eigenvalues of the metric tensor
     alpha : float
-        Regularisation parameter for the SoftAbs
+        Regularization parameter for the SoftAbs
 
     Returns
     -------
@@ -833,7 +811,7 @@ class _SoftAbsD1(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        M, H, lam, Q, alpha = inputs
+        M, _H, lam, Q, alpha = inputs
         ctx.alpha = alpha
         ctx.save_for_backward(M, lam, Q)
         ctx.save_for_forward(M, lam, Q)
@@ -958,15 +936,15 @@ def softabs_cometric(H: Tensor, alpha: float) -> Tensor:
 
 class SoftAbsCometric(CoMetric):
     """
-    Cometric that applies the SoftAbs regularisation to a base cometric.
+    Cometric that applies the SoftAbs regularization to a base cometric.
     'A General Metric for Riemannian Manifold Hamiltonian Monte Carlo'
 
     Parameters:
     -----------
     base_cometric : CoMetric
-        The base cometric to regularise
+        The base cometric to regularize
     alpha : float
-        Regularisation parameter for the SoftAbs
+        Regularization parameter for the SoftAbs
     """
 
     def __init__(self, base_cometric: CoMetric, alpha: float = 1e3):
@@ -1021,7 +999,7 @@ class PointCarreCoMetric(CoMetric):
 ################################################################
 
 
-class FunctionnalHeightMapCometric(CoMetric):
+class FunctionalHeightMapCometric(CoMetric):
     """
     Construct a cometric tensor from a parametric height map function.
     The metric tensor is simply  g_ij = <d_i r, d_j r> for r=(x,y,f(x,y)) where f is the height map function.
@@ -1195,7 +1173,7 @@ class PullBackCometric(CoMetric):
         J = torch.zeros(B, hw, d, device=x.device, dtype=x.dtype)
         pbar = tqdm(range(hw), desc="Computing pullback metric via autograd", leave=False)
         for i in pbar:
-            pbar.set_postfix({"Jacobian column": f"{i+1}/{hw}"})
+            pbar.set_postfix({"Jacobian column": f"{i + 1}/{hw}"})
             grad_i = torch.autograd.grad(
                 y_flat[:, i].sum(),  # sum over batch to get batch gradients
                 x,
@@ -1361,7 +1339,7 @@ class PBIG_Cometric_Gaussian(CoMetric):
         )
 
     def metric_tensor(self, z: torch.Tensor) -> torch.Tensor:
-        mu, logvar = self.decoder.complete_forward(z)
+        _mu, logvar = self.decoder.complete_forward(z)
         var = torch.exp(logvar.clamp(-8, 8)).flatten(start_dim=1)  # (batch_size, data_dim)
         J_mu = self.pb_mu.jacobian(z)  # (batch_size, data_dim, latent_dim)
         J_std = self.pb_std.jacobian(z)  # (batch_size, data_dim, latent_dim)
@@ -1673,7 +1651,7 @@ class FisherRaoCometric(CoMetric):
         hess : Tensor (B,p,p)
             Batch of Hessians of the log-likelihood function at x
         """
-        B, d = x.shape
+        B, _d = x.shape
         hess = []
         for i in range(B):
             hess_i = self.hessian_no_batch_all(x[i], theta)
@@ -1703,7 +1681,7 @@ class FisherRaoCometric(CoMetric):
             Batch of empirical fisher information matrices at theta
         """
         x = self.data_sampler(self.N_pts, theta)
-        B, p = theta.shape
+        B, _p = theta.shape
         hess = []
         for i in range(B):
             hess_i = self.hessian_no_batch_param(x, theta[i])
@@ -1715,7 +1693,7 @@ class FisherRaoCometric(CoMetric):
     def metric_tensor(self, theta: Tensor):
         g = self.inf_matrix(theta)
         if self.softabs_alpha is not None:
-            # Disguting code
+            # disgusting code
             g_inv = softabs_cometric(g.inverse(), alpha=self.softabs_alpha)
             g = g_inv.inverse()
         g += self.reg_coef * self.eye(theta)
@@ -1929,7 +1907,7 @@ class CentroidsCometric(CoMetric):
         centroids: Tensor,
         cometric_centroids: Tensor,
         reg_coef: float = 1e-3,
-        K: int = None,
+        K: int | None = None,
         metric_weight: bool = False,
         kappa: float = 1.0,
         use_global_temperature: bool = False,
@@ -2002,19 +1980,21 @@ class CentroidsCometric(CoMetric):
         assert cometric_centroids.ndim in [
             2,
             3,
-        ], f"Cometric centroids should be of shape (K,d) or (K,d,d), got {cometric_centroids.shape}"
-        assert (
-            cometric_centroids.shape[1] == self.centroids.shape[1]
-        ), f"Cometric centroids should have the same shape as centroids ({self.centroids.shape}), got {cometric_centroids.shape}"
+        ], (
+            f"Cometric centroids should be of shape (K,d) or (K,d,d), got {cometric_centroids.shape}"
+        )
+        assert cometric_centroids.shape[1] == self.centroids.shape[1], (
+            f"Cometric centroids should have the same shape as centroids ({self.centroids.shape}), got {cometric_centroids.shape}"
+        )
 
         # When diagonal cometric is used, cometric_centroids can be 2D
         if cometric_centroids.ndim == 2:
             self.is_diag = True
             return cometric_centroids
         else:
-            assert (
-                cometric_centroids.shape[1] == cometric_centroids.shape[2]
-            ), f"Cometric centroids should be square matrices, got {cometric_centroids.shape}"
+            assert cometric_centroids.shape[1] == cometric_centroids.shape[2], (
+                f"Cometric centroids should be square matrices, got {cometric_centroids.shape}"
+            )
 
         if not torch.allclose(cometric_centroids, cometric_centroids.mT):
             # Make it symmetric
@@ -2034,9 +2014,7 @@ class CentroidsCometric(CoMetric):
                 )  # (b,k)
                 c_term = torch.einsum(
                     "kd,kd,kd->k", self.centroids, self.cometric_centroids, self.centroids
-                ).unsqueeze(
-                    0
-                )  # (1,k)
+                ).unsqueeze(0)  # (1,k)
             else:
                 z_term = torch.einsum("bj,kij,bi->bk", z, self.cometric_centroids, z)
                 cross_term = torch.einsum(
@@ -2102,17 +2080,17 @@ class LANDCometric(CoMetric):
         alpha: int = 1,
         kappa: float = 1.0,
         reg_coef: float = 1e-3,
-        K: int = None,
+        K: int | None = None,
         use_global_temp: bool = False,
     ):
         super().__init__(is_diag=True)
 
-        assert (
-            centroids.ndim == 2
-        ), f"Centroids should be of shape (K,d), got {centroids.shape}"
-        assert alpha > 0 and isinstance(
-            alpha, int
-        ), f"Alpha should be a positive integer, got {alpha}"
+        assert centroids.ndim == 2, (
+            f"Centroids should be of shape (K,d), got {centroids.shape}"
+        )
+        assert alpha > 0 and isinstance(alpha, int), (
+            f"Alpha should be a positive integer, got {alpha}"
+        )
         assert reg_coef >= 0, f"Reg_coef should be a non-negative float, got {reg_coef}"
 
         self.register_buffer("centroids", centroids)
@@ -2174,7 +2152,7 @@ class LANDCometric(CoMetric):
 
 class LANDRBFCometric(CoMetric):
     """
-    Generalisation of the LAND cometric using RBF kernels instead of a single Gaussian kernel.
+    Generalization of the LAND cometric using RBF kernels instead of a single Gaussian kernel.
     The cometric is given by:
     G_inv(x) = diag(h(x)) + reg_coef * Id
     where h(x) = sum_k w_k exp(- ||x - c_k||^2 / (2 * tau_k^2))
@@ -2199,7 +2177,7 @@ class LANDRBFCometric(CoMetric):
     def __init__(
         self,
         data: Tensor,
-        K: int = None,
+        K: int | None = None,
         kappa: float = 1.0,
         reg_coef: float = 1e-3,
         learn_weights: bool = False,
@@ -2592,7 +2570,7 @@ class FinslerMetric(nn.Module):
     """
 
     def __init__(self):
-        super(FinslerMetric, self).__init__()
+        super().__init__()
 
     def forward(self, x: Tensor, v: Tensor) -> Tensor:
         """
@@ -2727,7 +2705,7 @@ class SlopeMetrics(FinslerMetric):
     """
 
     def __init__(self, f: nn.Module):
-        super(SlopeMetrics, self).__init__()
+        super().__init__()
         self.f = f
         self.f_no_batch = lambda x: self.f(x.unsqueeze(0)).squeeze(0)
 
@@ -2748,9 +2726,9 @@ class SlopeMetrics(FinslerMetric):
         f_x = self.f(x)
         df = torch.autograd.grad(f_x.sum(), x, create_graph=True)[0]
         return df
-    
+
     def forward(self, x: Tensor, v: Tensor) -> Tensor:
-        df = self.df_(x)        
+        df = self.df_(x)
         df_dx, df_dy = df[:, 0], df[:, 1]
 
         alpha = (
@@ -2789,7 +2767,7 @@ class RandersMetrics(FinslerMetric):
         omega: nn.Module,
         beta: float = 1.0,
     ):
-        super(RandersMetrics, self).__init__()
+        super().__init__()
         self.base_cometric = base_cometric
         self.omega = omega
         assert 0 <= beta <= 1, "Beta must be in the range [0, 1]"
@@ -3037,7 +3015,7 @@ class DualRandersMetrics(RandersMetrics):
     """
 
     def __init__(self, randers_metric: RandersMetrics, epsilon: float = 1e-8):
-        super(DualRandersMetrics, self).__init__(
+        super().__init__(
             base_cometric=randers_metric.base_cometric,
             omega=randers_metric.omega,
             beta=1.0,

@@ -1,6 +1,7 @@
 import pytest
-from geodesic_toolbox import cometric
 import torch
+
+from geodesic_toolbox import cometric
 
 
 ############################################################
@@ -317,7 +318,7 @@ def test_centroids_not_symetric():
     cometric_centroids = torch.eye(dim).unsqueeze(0).repeat(K, 1, 1)
     cometric_centroids[0, 0, 1] = 10.0  # Not symmetric
     temperature = 1.0
-    cm = cometric.CentroidsCometric(
+    cometric.CentroidsCometric(
         centroids=centroids,
         cometric_centroids=cometric_centroids,
         temperature=temperature,
@@ -332,7 +333,7 @@ def test_centroids_diff_shape_diag():
     centroids = torch.randn(K, dim)
     cometric_centroids = torch.randn(K, dim + 1)  # Wrong shape
     with pytest.raises(AssertionError):
-        cm = cometric.CentroidsCometric(
+        cometric.CentroidsCometric(
             centroids=centroids,
             cometric_centroids=cometric_centroids,
             temperature=1.0,
@@ -347,7 +348,7 @@ def test_centroids_not_square():
     centroids = torch.randn(K, dim)
     cometric_centroids = torch.randn(K, dim, dim + 1)  # Wrong shape
     with pytest.raises(AssertionError):
-        cm = cometric.CentroidsCometric(
+        cometric.CentroidsCometric(
             centroids=centroids,
             cometric_centroids=cometric_centroids,
             temperature=1.0,
@@ -360,7 +361,7 @@ def test_centroids_not_square():
 def _test_load_centroids(diag=True):
     # Test loading centroids from file
     import os
-    from geodesic_toolbox import utils
+
 
     K = 4
     dim = 2

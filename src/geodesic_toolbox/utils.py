@@ -1,10 +1,12 @@
-import torch
-from torch import Tensor
-from .cometric import CoMetric, RandersMetrics
-from einops import rearrange
-from math import ceil, exp, cos
-from tqdm import tqdm
+from math import ceil, cos, exp
+
 import numpy as np
+import torch
+from einops import rearrange
+from torch import Tensor
+from tqdm import tqdm
+
+from .cometric import CoMetric, RandersMetrics
 
 
 def sample_hypersphere(batch_size: int, dim: int, radius: float = 0.95) -> torch.Tensor:
@@ -275,7 +277,7 @@ def cosine_time_scaling_schedule(x: float, max_scaling: float = 5) -> float:
 def get_mf_image(
     cometric: CoMetric,
     embeddings: torch.Tensor = None,
-    bounds: list = None,
+    bounds: list | None = None,
     resolution: int = 200,
     use_mf_metric: bool = False,
     max_b_size: int = 512,

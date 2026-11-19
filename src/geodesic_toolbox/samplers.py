@@ -1,19 +1,19 @@
-import torch
-from torch import nn
-from tqdm import tqdm
-from torch import Tensor
-from torch.linalg import LinAlgError as _LinAlgError
-from typing import Callable
+from collections.abc import Callable
 
-from geodesic_toolbox.cometric import CoMetric, mat_sqrt, RandersMetrics
+import torch
+from torch import Tensor, nn
+from torch.linalg import LinAlgError as _LinAlgError
+from tqdm import tqdm
+
+from geodesic_toolbox.cometric import CoMetric, mat_sqrt
 from geodesic_toolbox.integrators import (
+    ExplicitLeapfrogIntegrator,
+    Hamiltonian,
+    HamiltonianImplicitMidpointIntegrator,
+    HamiltonianIntegrator,
     ImplicitLeapfrogIntegrator,
     Integrator,
-    Hamiltonian,
     SeparableLeapfrogIntegrator,
-    HamiltonianIntegrator,
-    HamiltonianImplicitMidpointIntegrator,
-    ExplicitLeapfrogIntegrator,
 )
 
 
