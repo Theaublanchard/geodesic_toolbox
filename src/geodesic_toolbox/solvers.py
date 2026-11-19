@@ -311,7 +311,7 @@ class ShootingSolver(GeodesicDistanceSolver):
         Output:
         res : Tensor, (b,) hamiltonian
         """
-        return self.cometric.cometric(q, p)
+        return self.cometric.dual_energy(q, p)
 
     def euler_step(self, H: Callable, p: Tensor, q: Tensor) -> tuple[Tensor, Tensor]:
         """
@@ -4100,7 +4100,7 @@ class ExpMapRanders(torch.nn.Module):
         randers: RandersMetrics,
         T_max=1.0,
         T=10,
-        solver: str = "leapfrog_explicit",
+        solver: str = "leapfrog_implicit",
         substeps: int = 1,
         omega: float = 10.0,
         n_fix_pts: int = 5,
@@ -4262,7 +4262,7 @@ class ExpMapRiemann(torch.nn.Module):
         cometric: CoMetric,
         T_max=1.0,
         T=10,
-        solver: str = "leapfrog_explicit",
+        solver: str = "leapfrog_implicit",
         substeps: int = 1,
         omega: float = 10.0,
         n_fix_pts: int = 5,
