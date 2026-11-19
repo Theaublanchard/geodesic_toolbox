@@ -87,11 +87,16 @@ class EulerIntegrator(Integrator):
         Fonction that takes a input (B, d) tensor and returns a (B,) tensor.
     gamma : float
         The step size for the Euler integrator.
+    pbar : bool
+        If True, display a progress bar during integration. Defaults to False.
     """
 
-    def __init__(self, f: BatchedFunction, gamma: float, substeps: int = 1):
+    def __init__(
+        self, f: BatchedFunction, gamma: float, substeps: int = 1, pbar: bool = False
+    ):
         super().__init__(f)
         self.f = f
+        self.pbar = pbar
         self.substeps = substeps
         self.gamma = gamma / self.substeps
 
@@ -156,7 +161,10 @@ class EulerIntegrator(Integrator):
         if return_traj:
             traj = [x0.clone().detach()]
 
-        for k in tqdm(range(L - 1), desc="Euler integration", unit="steps", leave=False):
+        steps = range(L - 1)
+        if self.pbar:
+            steps = tqdm(steps, desc="Euler integration", unit="steps", leave=False)
+        for k in steps:
             for _ in range(self.substeps):
                 x0_step = x1
                 x1 = self.euler_step(x1, gamma)
@@ -204,6 +212,8 @@ class ImplicitMidpointIntegrator(torch.nn.Module):
         Number of substeps for the implicit midpoint step.
         This is the number of times the implicit midpoint step is applied
         to the same pair of states (x0, x1) before updating the states.
+    pbar : bool
+        If True, display a progress bar during integration. Defaults to False.
     # The following parameters are only used if jacobian="estimate":
     jacobian_mc : int
         Number of Monte Carlo probes for estimating the log-Jacobian using Hutchinson's estimator.
@@ -223,6 +233,7 @@ class ImplicitMidpointIntegrator(torch.nn.Module):
         jacobian_mc: int = 1,
         russian_roulette: float = 0.5,
         compile_step: bool = False,
+        pbar: bool = False,
     ):
         torch.nn.Module.__init__(self)
 
@@ -235,6 +246,7 @@ class ImplicitMidpointIntegrator(torch.nn.Module):
         self.gamma = gamma / self.substeps
         self.russian_roulette = russian_roulette
         self.jacobian_mc = jacobian_mc
+        self.pbar = pbar
 
         if jacobian == "estimate":
             self.log_det_jac = self.estimate_log_det_jac
@@ -430,10 +442,12 @@ class ImplicitMidpointIntegrator(torch.nn.Module):
         if return_traj:
             traj = [x0.clone()]
 
-        pbar = tqdm(
-            range(L - 1), desc="Implicit midpoint integration", unit="steps", leave=False
-        )
-        for k in pbar:
+        steps = range(L - 1)
+        if self.pbar:
+            steps = tqdm(
+                steps, desc="Implicit midpoint integration", unit="steps", leave=False
+            )
+        for k in steps:
             for _ in range(self.substeps):
                 x1 = self.step(x0, gamma)
                 delta = self.log_det_jac((x0 + x1) / 2, gamma)
@@ -635,10 +649,14 @@ class HamiltonianEulerIntegrator(EulerIntegrator, HamiltonianIntegrator):
         The number of substeps for the Euler integrator.
         This is the number of times the Euler step is applied to the same pair of states (q_0, p_0)
         and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
+    pbar : bool
+        If True, display a progress bar during integration. Defaults to False.
     """
 
-    def __init__(self, H: Hamiltonian, gamma: float, substeps: int = 1):
-        super().__init__(HamiltonianToBatchedFunction(H), gamma, substeps)
+    def __init__(
+        self, H: Hamiltonian, gamma: float, substeps: int = 1, pbar: bool = False
+    ):
+        super().__init__(HamiltonianToBatchedFunction(H), gamma, substeps, pbar=pbar)
         self.H = H
 
     def forward(
@@ -700,6 +718,8 @@ class SeparableLeapfrogIntegrator(HamiltonianIntegrator):
         The number of substeps for the leapfrog integrator.
         This is the number of times the leapfrog step is applied to the same pair of states (q_0, p_0)
         and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
+    pbar : bool
+        If True, display a progress bar during integration. Defaults to False.
     """
 
     def __init__(
@@ -708,8 +728,10 @@ class SeparableLeapfrogIntegrator(HamiltonianIntegrator):
         gamma: float,
         substeps: int = 1,
         compile_step: bool = False,
+        pbar: bool = False,
     ):
         super().__init__(H)
+        self.pbar = pbar
         self.gamma = gamma / substeps
         self.substeps = substeps
         self.step = self.leapfrog_step
@@ -788,7 +810,10 @@ class SeparableLeapfrogIntegrator(HamiltonianIntegrator):
         else:
             gamma = dirs.reshape(-1, 1).to(device=q_0.device, dtype=q_0.dtype) * self.gamma
 
-        for k in tqdm(range(L - 1), desc="Leapfrog integration", unit="steps", leave=False):
+        steps = range(L - 1)
+        if self.pbar:
+            steps = tqdm(steps, desc="Leapfrog integration", unit="steps", leave=False)
+        for k in steps:
             q_1, p_1 = self.step(q_1, p_1, gamma)
 
             if return_traj:
@@ -825,6 +850,8 @@ class ImplicitLeapfrogIntegrator(HamiltonianIntegrator):
         The number of substeps for the leapfrog integrator.
         This is the number of times the leapfrog step is applied to the same pair of states (q_0, p_0)
         and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
+    pbar : bool
+        If True, display a progress bar during integration. Defaults to False.
     """
 
     def __init__(
@@ -834,8 +861,10 @@ class ImplicitLeapfrogIntegrator(HamiltonianIntegrator):
         n_fix_pts: int,
         substeps: int = 1,
         compile_step: bool = False,
+        pbar: bool = False,
     ):
         super().__init__(H)
+        self.pbar = pbar
         self.n_fix_pts = n_fix_pts
         self.substeps = substeps
         self.gamma = gamma / self.substeps
@@ -974,7 +1003,10 @@ class ImplicitLeapfrogIntegrator(HamiltonianIntegrator):
         else:
             gamma = dirs.reshape(-1, 1).to(device=q_0.device, dtype=q_0.dtype) * self.gamma
 
-        for k in tqdm(range(L - 1), desc="Leapfrog integration", unit="steps", leave=False):
+        steps = range(L - 1)
+        if self.pbar:
+            steps = tqdm(steps, desc="Leapfrog integration", unit="steps", leave=False)
+        for k in steps:
             q_1, p_1 = self.step(q_1, p_1, gamma)
 
             if return_traj:
@@ -1011,6 +1043,8 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         The number of substeps for the leapfrog integrator.
         This is the number of times the leapfrog step is applied to the same pair of states (q_0, p_0)
         and (q_1, p_1) before updating the states. This can be used to improve the stability of the integrator.
+    pbar : bool
+        If True, display a progress bar during integration. Defaults to False.
     """
 
     def __init__(
@@ -1020,8 +1054,10 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
         omega: float,
         substeps: int = 1,
         compile_step: bool = False,
+        pbar: bool = False,
     ):
         super().__init__(H)
+        self.pbar = pbar
         self.substeps = substeps
         self.gamma = gamma / self.substeps
         self.omega = omega
@@ -1260,7 +1296,10 @@ class ExplicitLeapfrogIntegrator(HamiltonianIntegrator):
             gamma = dirs.reshape(-1, 1).to(device=q_0.device, dtype=q_0.dtype) * self.gamma
 
         integration_failed = False
-        for k in tqdm(range(L - 1), desc="Leapfrog steps", unit="steps", leave=False):
+        steps = range(L - 1)
+        if self.pbar:
+            steps = tqdm(steps, desc="Leapfrog steps", unit="steps", leave=False)
+        for k in steps:
             for _ in range(self.substeps):
                 q_0, p_0, q_1, p_1 = self.step(q_0, p_0, q_1, p_1, gamma)
 
@@ -1324,6 +1363,8 @@ class HamiltonianImplicitMidpointIntegrator(ImplicitMidpointIntegrator, Hamilton
         The number of Monte Carlo samples to use for estimating the log-Jacobian when using the "estimate" method.
     russian_roulette : float
         The probability of terminating the series for estimating the log-Jacobian when using the "estimate" method.
+    pbar : bool
+        If True, display a progress bar during integration. Defaults to False.
     """
 
     def __init__(
@@ -1337,6 +1378,7 @@ class HamiltonianImplicitMidpointIntegrator(ImplicitMidpointIntegrator, Hamilton
         jacobian_mc: int = 1,
         russian_roulette: float = 0.5,
         compile_step: bool = False,
+        pbar: bool = False,
     ):
         super().__init__(
             HamiltonianToBatchedFunction(H),
@@ -1349,6 +1391,7 @@ class HamiltonianImplicitMidpointIntegrator(ImplicitMidpointIntegrator, Hamilton
             jacobian_mc=jacobian_mc,
             russian_roulette=russian_roulette,
             compile_step=compile_step,
+            pbar=pbar,
         )
 
         self.log_det_jac = self.zero_log_det_jac
