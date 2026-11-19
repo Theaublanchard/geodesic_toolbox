@@ -12,6 +12,7 @@ dependencies = [
     "kmedoids>=0.5.5",
     "networkx>=3.6.1",
     "numpy>=2.5.2",
+    "pytest>=9.2.0",
     "scikit-learn>=1.9.0",
     "scipy>=1.18.1",
     "torch>=2.13.0",
@@ -23,3 +24,7 @@ dependencies = [
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]
 build-backend = "uv_build"
+
+
+[tool.ruff.lint]
+ignore = ["B008"]
