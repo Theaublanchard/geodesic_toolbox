@@ -222,6 +222,162 @@ class Sampler(nn.Module):
         raise NotImplementedError
 
 
+class MALA(Sampler):
+    """
+    Implementation of the Metropolis-adjusted Langevin algorithm (MALA) for sampling from a target distribution.
+
+    Parameters
+    ----------
+    log_target : Callable[[Tensor], Tensor]
+        Unnormalized log-density of the target distribution, mapping (b, d) positions to (b,) log-densities.
+    score_func : Callable[[Tensor], Tensor]
+        Gradient of the log-target with respect to the position, mapping (b, d) positions to (b, d) gradients.
+    step_size : float
+        Step size for the Langevin proposal.
+    mass_matrix : Tensor (d, d)
+        Mass matrix for the momentum distribution. Defaults to the identity matrix.
+    pbar : bool
+        If True, display a progress bar while collecting samples.
+    """
+
+    def __init__(
+        self,
+        log_target: Callable[[Tensor], Tensor],
+        score_func: Callable[[Tensor], Tensor],
+        step_size: float,
+        mass_matrix: Tensor | None = None,
+        pbar: bool = False,
+        bounds: float | None = None,
+    ):
+        super().__init__(pbar)
+        self.log_target = log_target
+        self.score_func = score_func
+        self.step_size = torch.tensor(step_size)
+        self.bounds = bounds
+        self.mass_matrix = (
+            mass_matrix
+            if mass_matrix is not None
+            else torch.eye(log_target(torch.zeros(1, 2)).shape[1])
+        )
+
+    def q_proposal(self, x: Tensor, x_prime: Tensor):
+        """
+        Compute the log of q where q is defined as:
+            q(x' | x) ~ exp( - 1/(4*step_size) * ||x' - x - step_size * mass_matrix * score(x) ||_mass_matrix^2 )
+        """
+        diff = x_prime - x - self.step_size * self.mass_matrix * self.score_func(x)
+        return -0.25 / self.step_size * torch.sum(diff**2, dim=-1)
+
+    def step(self, state: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        """Perform a single MALA step.
+
+        Parameters
+        ----------
+        state : Tensor (num_chains, dimension)
+            Current position of each chain.
+
+        Returns
+        -------
+        next_state : Tensor (num_chains, dimension)
+            Next position of each chain after the MALA transition.
+        diagnostics : dict[str, Tensor]
+            Diagnostic information about the transition, including acceptance indicators and probabilities.
+        """
+        if state.ndim != 2:
+            raise ValueError("state must have shape (num_chains, dimension).")
+        # Compute the gradient of the log-target at the current state
+        grad_log_target = self.score_func(state)
+        # Propose a new state using the Langevin dynamics
+        noise = torch.randn_like(state)
+        A = self.mass_matrix.to(state.device).to(state.dtype)
+        A_sqrt = mat_sqrt(A)
+        noise = self.step_size.sqrt() * A_sqrt @ noise.unsqueeze(-1)
+        biais = self.step_size * A @ grad_log_target.unsqueeze(-1)
+        proposal = state + biais.squeeze(-1) + noise.squeeze(-1)
+
+        log_alpha = (
+            self.log_target(proposal)
+            + self.q_proposal(proposal, state)
+            - self.log_target(state)
+            - self.q_proposal(state, proposal)
+        )
+
+        if self.bounds is not None:
+            log_alpha = torch.where(
+                torch.linalg.norm(proposal, dim=-1) <= self.bounds,
+                log_alpha,
+                torch.full_like(log_alpha, -torch.inf),
+            )
+        acceptance_probability = torch.exp(torch.clamp(log_alpha, max=0.0))
+        acceptance_probability = torch.nan_to_num(acceptance_probability, nan=0.0)
+        accepted = torch.rand_like(acceptance_probability) < acceptance_probability
+        next_state = torch.where(accepted[:, None], proposal, state)
+        return next_state, {
+            "accepted": accepted,
+            "acceptance_probability": acceptance_probability,
+        }
+
+    def sample(
+        self, initial_state: Tensor, num_warmup: int, num_samples: int
+    ) -> tuple[Tensor, dict[str, object]]:
+        """Run warmup and collect post-warmup states.
+
+        Parameters
+        ----------
+        initial_state : Tensor (num_chains, dimension)
+            Initial position of each chain.
+        num_warmup : int
+            Number of transitions to discard before collecting samples.
+        num_samples : int
+            Number of post-warmup transitions to retain.
+
+        Returns
+        -------
+        samples : Tensor (num_chains, num_samples, dimension)
+            Collected chain states. Rejected transitions remain repeated states.
+        diagnostics : dict[str, object]
+            Aggregate and per-transition sampling diagnostics.
+        """
+        if initial_state.ndim != 2:
+            raise ValueError("initial_state must have shape (num_chains, dimension).")
+        if num_warmup < 0:
+            raise ValueError("num_warmup must be non-negative.")
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive.")
+
+        state = initial_state.clone()
+        warmup_accepted = 0
+        for _ in range(num_warmup):
+            state, transition = self.step(state)
+            warmup_accepted += transition["accepted"].sum().item()
+
+        samples = []
+        accepted = []
+        probabilities = []
+        iterator = (
+            tqdm(range(num_samples), desc="Sampling", unit="draws")
+            if self.pbar
+            else range(num_samples)
+        )
+        for _ in iterator:
+            state, transition = self.step(state)
+            samples.append(state.clone())
+            accepted.append(transition["accepted"])
+            probabilities.append(transition["acceptance_probability"])
+
+        accepted_tensor = torch.stack(accepted, dim=1)
+        probability_tensor = torch.stack(probabilities, dim=1)
+        diagnostics: dict[str, object] = {
+            "acceptance_rate": accepted_tensor.float().mean().item(),
+            "acceptance_rate_by_chain": accepted_tensor.float().mean(dim=1),
+            "acceptance_probability": probability_tensor,
+            "warmup_acceptance_rate": (
+                warmup_accepted / (num_warmup * state.shape[0]) if num_warmup else None
+            ),
+        }
+        return torch.stack(samples, dim=1), diagnostics
+
+
 class EuclideanHamiltonian(Hamiltonian):
     """Separable Euclidean Hamiltonian for an unnormalized log-density.
 
@@ -336,6 +492,10 @@ class HamiltonianMonteCarlo(Sampler):
             self.hamiltonian, step_size, compile_step=compile_step
         )
 
+    def sample_momentum(self, state: Tensor) -> Tensor:
+        momentum = torch.randn_like(state) * self.hamiltonian.momentum_std
+        return momentum
+
     @torch.no_grad()
     def step(self, state: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
         """
@@ -355,7 +515,7 @@ class HamiltonianMonteCarlo(Sampler):
         """
         if state.ndim != 2:
             raise ValueError("state must have shape (num_chains, dimension).")
-        momentum = torch.randn_like(state) * self.hamiltonian.momentum_std
+        momentum = self.sample_momentum(state)
         # No need to compute the log_det here since the leapfrog integrator is symplectic (log_det = 0)
         proposal, proposal_momentum, _ = self.integrator(
             state,
@@ -412,9 +572,18 @@ class HamiltonianMonteCarlo(Sampler):
 
         state = initial_state.clone()
         warmup_accepted = 0
-        for _ in range(num_warmup):
+        iter_warmup = (
+            tqdm(range(num_warmup), desc="Warmup", unit="draws")
+            if self.pbar
+            else range(num_warmup)
+        )
+        for i in iter_warmup:
             state, transition = self.step(state)
             warmup_accepted += transition["accepted"].sum().item()
+            if self.pbar:
+                iter_warmup.set_postfix(
+                    {"warmup_acceptance_rate": warmup_accepted / ((1 + i) * state.shape[0])}
+                )
 
         samples = []
         accepted = []
@@ -424,11 +593,16 @@ class HamiltonianMonteCarlo(Sampler):
             if self.pbar
             else range(num_samples)
         )
-        for _ in iterator:
+        for i in iterator:
             state, transition = self.step(state)
             samples.append(state.clone())
             accepted.append(transition["accepted"])
             probabilities.append(transition["acceptance_probability"])
+
+            if self.pbar:
+                iterator.set_postfix(
+                    {"acceptance_rate": torch.stack(accepted, dim=1).float().mean().item()}
+                )
 
         accepted_tensor = torch.stack(accepted, dim=1)
         probability_tensor = torch.stack(probabilities, dim=1)
@@ -618,7 +792,7 @@ class _RHMCSamplerBase(Sampler):
         bounds: float | None = None,
         pbar: bool = False,
         H: Hamiltonian | None = None,
-        compile_step: bool = False,
+        compile_step: bool = True,
     ):
         super().__init__(pbar)
         if num_integration_steps < 2:
@@ -746,9 +920,19 @@ class _RHMCSamplerBase(Sampler):
         state = initial_state.clone()
 
         warmup_accepted = 0
-        for _ in range(num_warmup):
+        iter_warmup = (
+            tqdm(range(num_warmup), desc="Warmup", unit="draws")
+            if self.pbar
+            else range(num_warmup)
+        )
+        for i in iter_warmup:
             state, transition = self.step(state)
             warmup_accepted += transition["accepted"].sum().item()
+
+            if self.pbar:
+                iter_warmup.set_postfix(
+                    {"warmup_acceptance_rate": warmup_accepted / ((1 + i) * state.shape[0])}
+                )
 
         samples, accepted, probabilities, valid = [], [], [], []
         flipped = []
@@ -757,7 +941,7 @@ class _RHMCSamplerBase(Sampler):
             if self.pbar
             else range(num_samples)
         )
-        for _ in iterator:
+        for i in iterator:
             state, transition = self.step(state)
 
             samples.append(state.clone())
@@ -767,6 +951,11 @@ class _RHMCSamplerBase(Sampler):
 
             if "flipped" in transition:
                 flipped.append(transition["flipped"])
+
+            if self.pbar:
+                iterator.set_postfix(
+                    {"acceptance_rate": torch.stack(accepted, dim=1).float().mean().item()}
+                )
 
         accepted_tensor = torch.stack(accepted, dim=1)
         diagnostics: dict[str, object] = {
@@ -806,7 +995,7 @@ class ImplicitMidpointRHMCSampler(_RHMCSamplerBase):
         bounds: float | None = None,
         pbar: bool = False,
         H: Hamiltonian | None = None,
-        compile_step: bool = False,
+        compile_step: bool = True,
     ):
         super().__init__(
             cometric,
@@ -846,7 +1035,7 @@ class ImplicitLeapfrogRHMCSampler(_RHMCSamplerBase):
         bounds: float | None = None,
         pbar: bool = False,
         H: Hamiltonian | None = None,
-        compile_step: bool = False,
+        compile_step: bool = True,
     ):
         super().__init__(
             cometric,
@@ -886,13 +1075,13 @@ class ExplicitRHMCSampler(_RHMCSamplerBase):
         num_integration_steps: int,
         step_size: float,
         omega: float,
-        fixed_point_iterations: int=1,
+        fixed_point_iterations: int = 1,  # unused but kept for compatibility
         log_target: Callable[[Tensor], Tensor] | None = None,
         momentum_std: float = 1.0,
         bounds: float | None = None,
         pbar: bool = False,
         H: Hamiltonian | None = None,
-        compile_step: bool = False,
+        compile_step: bool = True,
     ):
         super().__init__(
             cometric,
