@@ -355,6 +355,7 @@ class HamiltonianImplicitMidpointIntegrator(ImplicitMidpointIntegrator, Hamilton
             pbar=pbar,
         )
 
+        self.H = H
         self.log_det_jac = self.zero_log_det_jac
 
     def zero_log_det_jac(self, x_mid: Tensor, gamma: Tensor) -> Tensor:
