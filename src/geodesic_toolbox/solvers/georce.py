@@ -2,7 +2,7 @@
 GEORCE solver with statistics (Riemannian and Finsler).
 """
 
-from dataclasses import field
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -13,6 +13,7 @@ from ..finsler import FinslerMetric
 from .base import GeodesicDistanceSolver
 
 
+@dataclass
 class GEORCELineSearchStats:
     initial_energy: float
     final_energy: float
@@ -20,6 +21,7 @@ class GEORCELineSearchStats:
     accepted: bool
 
 
+@dataclass
 class GEORCEIterationStats:
     iteration: int
     grad_norm: float
@@ -29,6 +31,7 @@ class GEORCEIterationStats:
     line_search: GEORCELineSearchStats
 
 
+@dataclass
 class GEORCERunStats:
     initial_distance: float | None
     initial_energy: float | None
@@ -378,19 +381,14 @@ class GEORCE(GeodesicDistanceSolver):
                 [G_inv_0[None, :], G_inv_t], dim=0
             )  # (T-1, d, d) | (T-1, d, d)
 
-            # L6
-            if G_inv_t.ndim == 3:
-                # Avoid explicit inverse: solve G_inv * x = u, then use u * x.
-                G_u = torch.linalg.solve(G_inv_t[1:], u_t_i[1:].unsqueeze(-1)).squeeze(-1)
-                v_t = u_t_i[1:] * G_u  # (T-2, d)
-            else:
-                G_t = 1 / G_inv_t  # (T-1,d)
-                v_t = u_t_i[1:] * G_t[1:] * u_t_i[1:]  # (T-2, d)
-            v_t = torch.autograd.grad(
-                v_t.sum(),
-                x_t_i,
-                materialize_grads=True,
-            )[0]
+            # L6: v_t = d/dx (u^T G(x) u) holding u fixed. torch.func.grad returns
+            # zero for a position-independent (constant) metric, where this is the
+            # correct value, instead of raising like torch.autograd.grad would.
+            u_seg = u_t_i[1:]  # (T-2, d)
+            v_t = torch.func.grad(
+                lambda x: self.cometric.dot(x, u_seg, u_seg).sum(),  # noqa: B023
+                argnums=(0,),
+            )(x_t_i)[0]  # (T-2, d)
 
             # L7
             mu_t = self.get_mut_t(v_t, G_inv_t, diff)  # (T-1, d)
@@ -582,7 +580,7 @@ class GEORCEFinsler(torch.nn.Module):
         self.c = c
         self.alpha_0 = alpha_0
         self.pbar = pbar
-        self.georce_finsler_stats: GEORCERunStats | None = None
+        self.georce_stats: GEORCERunStats | None = None
 
     def compute_distance(
         self, traj: torch.Tensor, tangent_vectors: torch.Tensor = None
