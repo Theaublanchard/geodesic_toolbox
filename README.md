@@ -56,12 +56,7 @@ from geodesic_toolbox import ShootingSolver, IdentityCoMetric
 
 # Define the metric (Euclidean space)
 cometric = IdentityCoMetric()
-solver = ShootingSolver(
-    cometric=cometric,
-    lr=0.1,
-    n_step=100,
-    dt=0.01
-)
+solver = ShootingSolver(cometric=cometric, lr=0.1, n_step=100, dt=0.01)
 
 # Two points on the manifold
 q0 = torch.tensor([[0.0, 0.0]])
@@ -96,6 +91,7 @@ print(f"Hyperbolic distance: {distance.item():.4f}")
 from geodesic_toolbox import PullBackCometric
 import torch.nn as nn
 
+
 # Define a diffeomorphism (e.g., neural network)
 class MyDiffeomorphism(nn.Module):
     def __init__(self):
@@ -103,18 +99,19 @@ class MyDiffeomorphism(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(2, 64),
             nn.ReLU(),
-            nn.Linear(64, 3)  # Output dimension
+            nn.Linear(64, 3),  # Output dimension
         )
-  
+
     def forward(self, x):
         return self.net(x)
+
 
 # Create pullback metric
 diffeo = MyDiffeomorphism()
 cometric = PullBackCometric(
     diffeo=diffeo,
     base_cometric=IdentityCoMetric(is_diag=False),
-    method="finite_difference"
+    method="finite_difference",
 )
 
 solver = ShootingSolver(cometric=cometric, n_step=100)
@@ -139,9 +136,9 @@ solver = SolverGraph(
     cometric=cometric,
     data=data,
     n_neighbors=10,
-    dt=0.01,           # Trajectory discretization
+    dt=0.01,  # Trajectory discretization
     batch_size=64,
-    max_data_count=500 # Subsample for memory efficiency
+    max_data_count=500,  # Subsample for memory efficiency
 )
 
 distance = solver(q0, q1)
@@ -159,10 +156,11 @@ from geodesic_toolbox import GEORCE
 
 solver = GEORCE(
     cometric=cometric,
-    T=100,           # Trajectory discretization
-    max_iter=200,    # Maximum iterations
-    tol=1e-6,        # Convergence tolerance
-    c=0.9, rho=0.5   # Line search parameters
+    T=100,  # Trajectory discretization
+    max_iter=200,  # Maximum iterations
+    tol=1e-6,  # Convergence tolerance
+    c=0.9,
+    rho=0.5,  # Line search parameters
 )
 
 distance = solver(q0, q1)
@@ -179,12 +177,7 @@ Combines graph-based initialization with GEORCE refinement.
 from geodesic_toolbox import SolverGraphGEORCE
 
 solver = SolverGraphGEORCE(
-    cometric=cometric,
-    data=data,
-    n_neighbors=10,
-    T=100,
-    max_iter=100,
-    tol=1e-6
+    cometric=cometric, data=data, n_neighbors=10, T=100, max_iter=100, tol=1e-6
 )
 distance = solver(q0, q1)
 ```
@@ -201,11 +194,11 @@ from geodesic_toolbox import ShootingSolver
 
 solver = ShootingSolver(
     cometric=cometric,
-    lr=0.1,                    # Learning rate for optimization
-    n_step=100,                # Number of optimization steps
-    dt=0.01,                   # Time discretization step
-    method="euler",            # Integrator: "euler" or "leapfrog"
-    convergence_threshold=1e-3 # Stop when endpoint error below threshold
+    lr=0.1,  # Learning rate for optimization
+    n_step=100,  # Number of optimization steps
+    dt=0.01,  # Time discretization step
+    method="euler",  # Integrator: "euler" or "leapfrog"
+    convergence_threshold=1e-3,  # Stop when endpoint error below threshold
 )
 
 distance = solver(q0, q1)
@@ -224,9 +217,9 @@ from geodesic_toolbox import BVP_ode
 
 solver = BVP_ode(
     cometric=cometric,
-    T=100,        # Number of discretization points
-    dim=2,        # Manifold dimension
-    verbose=0     # Verbosity of scipy.integrate.solve_bvp
+    T=100,  # Number of discretization points
+    dim=2,  # Manifold dimension
+    verbose=0,  # Verbosity of scipy.integrate.solve_bvp
 )
 
 distance = solver(q0, q1)
@@ -269,7 +262,7 @@ scaled = 10.5 * IdentityCoMetric()
 combined = IdentityCoMetric() + PointCarreCoMetric()
 
 # Use in solver
-solver = ShootingSolver(cometric=combined+scaled)
+solver = ShootingSolver(cometric=combined + scaled)
 ```
 
 ## Advanced Usage
@@ -284,11 +277,7 @@ import torch.nn as nn
 from geodesic_toolbox import ShootingSolver, DiagonalCometricModel
 
 # Learnable metric
-metric = DiagonalCometricModel(
-    in_dim=2,
-    hidden_dim=32,
-    latent_dim=2
-)
+metric = DiagonalCometricModel(in_dim=2, hidden_dim=32, latent_dim=2)
 optimizer = torch.optim.Adam(metric.parameters(), lr=1e-3)
 solver = ShootingSolver(cometric=metric, n_step=50)
 
@@ -296,10 +285,10 @@ solver = ShootingSolver(cometric=metric, n_step=50)
 for epoch in range(100):
     q0 = torch.randn(32, 2, requires_grad=True)
     q1 = torch.randn(32, 2, requires_grad=True)
-  
+
     distances = solver(q0, q1)
     loss = distances.mean()
-  
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
@@ -316,11 +305,11 @@ traj = solver.get_trajectories(q0, q1)
 
 # Plot trajectory
 plt.figure(figsize=(8, 8))
-plt.plot(traj[0, :, 0].detach(), traj[0, :, 1].detach(), 'b-', label='Geodesic')
-plt.scatter([q0[0, 0]], [q0[0, 1]], c='green', s=100, label='Start')
-plt.scatter([q1[0, 0]], [q1[0, 1]], c='red', s=100, label='End')
+plt.plot(traj[0, :, 0].detach(), traj[0, :, 1].detach(), "b-", label="Geodesic")
+plt.scatter([q0[0, 0]], [q0[0, 1]], c="green", s=100, label="Start")
+plt.scatter([q1[0, 0]], [q1[0, 1]], c="red", s=100, label="End")
 plt.legend()
-plt.axis('equal')
+plt.axis("equal")
 plt.show()
 ```
 

@@ -6,7 +6,8 @@ from einops import rearrange
 from torch import Tensor
 from tqdm import tqdm
 
-from .cometric import CoMetric, RandersMetrics
+from .cometric import CoMetric
+from .finsler import RandersMetrics
 
 
 def sample_hypersphere(batch_size: int, dim: int, radius: float = 0.95) -> torch.Tensor:
@@ -435,7 +436,11 @@ def sample_cometric_normal(cometric: CoMetric, q0: torch.Tensor) -> torch.Tensor
 
 
 def sample_cone(
-    x_0: Tensor, randers: RandersMetrics, N_pts=1, theta: float = torch.pi / 4, max_iter=1000
+    x_0: Tensor,
+    randers: RandersMetrics,
+    N_pts=1,
+    theta: float = torch.pi / 4,
+    max_iter=1000,
 ) -> Tensor:
     """
     Sample a random vector in the cone defined by the angle theta around the direction w.
@@ -617,3 +622,84 @@ def _random_VMF_cos(d: int, kappa: float, n: int):
         out.append(t[accept])
         found += len(out[-1])
     return torch.cat(out)[:n]
+
+
+def empirical_cov_mat(x: Tensor, mu: Tensor = None, eps: float = 1e-6) -> Tensor:
+    """Computes the empirical covariance matrix of the data x.
+    If mu is provided, the covariance is computed with respect to mu.
+    Else the covariance is computed with respect to the mean of x.
+
+    Parameters
+    ----------
+    x : Tensor (N,d)
+        The data.
+    mu : Tensor (d,)
+        The mean of the data.
+    eps : float
+        A small value to add to the diagonal for numerical stability.
+
+    Returns
+    -------
+    cov : Tensor (d,d)
+        The covariance matrix.
+    """
+    if mu is None:
+        mu = x.mean(dim=0)
+    mu = mu[None, :]
+    cov = (x - mu).T @ (x - mu) / (x.shape[0] - 1)
+    cov += eps * torch.eye(x.shape[1], device=x.device)
+    return cov
+
+
+def empirical_diag_cov_mat(x: Tensor, mu: Tensor = None, eps: float = 1e-6) -> Tensor:
+    """Computes the empirical covariance matrix of the data x.
+    The matrix is here diagonal.
+    If mu is provided, the covariance is computed with respect to mu.
+    Else the covariance is computed with respect to the mean of x.
+
+    Parameters
+    ----------
+    x : Tensor (N,d)
+        The data.
+    mu : Tensor (d,)
+        The mean of the data.
+    eps : float
+        A small value to add to the diagonal for numerical stability.
+
+    Returns
+    -------
+    cov : Tensor (d,d)
+        The covariance matrix.
+    """
+    if mu is None:
+        mu = x.mean(dim=0)
+    mu = mu[None, :]
+    var = torch.linalg.vector_norm(x - mu, dim=1).mean()
+    cov = (var + eps) * torch.eye(x.shape[1], device=x.device)
+    return cov
+
+
+__all__ = [
+    "batched_kro",
+    "constant_time_scaling_schedule",
+    "cosine_time_scaling_schedule",
+    "delta",
+    "empirical_cov_mat",
+    "empirical_diag_cov_mat",
+    "get_bounds",
+    "get_mf_image",
+    "hamiltonian",
+    "linear_time_scaling_schedule",
+    "magnification_factor",
+    "magnification_factor_metric",
+    "pointcarre_dst",
+    "random_VMF",
+    "sample_cometric_normal",
+    "sample_cone",
+    "sample_cone_VMF",
+    "sample_hypersphere",
+    "scale_lr_magnification",
+    "scaled_euclidean_dst",
+    "vec",
+    "vector_kro",
+]
