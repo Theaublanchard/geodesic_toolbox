@@ -396,8 +396,8 @@ class CoMetric(torch.nn.Module):
             Angle between u and v at q
         """
         eps = 1e-8  # small value to avoid division by zero
-        u_norm = self.metric(q, u).sqrt()
-        v_norm = self.metric(q, v).sqrt()
+        u_norm = self.metric(q, u)
+        v_norm = self.metric(q, v)
         uv = self.dot(q, u, v)
         cos_angle = uv / (u_norm * v_norm + eps)
         cos_angle = torch.clamp(cos_angle, -1.0, 1.0)  # clamp to avoid NaN

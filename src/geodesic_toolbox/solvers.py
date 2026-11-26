@@ -33,6 +33,7 @@ from .integrators import (
     ExplicitLeapfrogIntegrator,
     HamiltonianEulerIntegrator,
     ImplicitLeapfrogIntegrator,
+    Hamiltonian,
 )
 from .utils import (
     batched_kro,
@@ -4076,10 +4077,67 @@ class SolverGraphSplineFinsler(torch.nn.Module):
         return final_traj
 
 
+class HamiltonianRanders(Hamiltonian):
+    def __init__(self, randers: RandersMetrics):
+        super().__init__()
+        self.randers = randers
+        self.dual_r = DualRandersMetrics(randers)
+
+    def H(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Hamiltonian function for the Randers manifold.
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        p : torch.Tensor (b, d)
+            Momentum
+
+        Returns
+        -------
+        H : torch.Tensor (b,)
+            Hamiltonian value
+        """
+        H = self.dual_r(q, p)
+        return 0.5 * H**2
+
+    def forward(self, q, p):
+        return self.H(q, p)
+
+
+class HamiltonianRiemann(Hamiltonian):
+    def __init__(self, cometric: CoMetric):
+        super().__init__()
+        self.cometric = cometric
+
+    def H(self, q: Tensor, p: Tensor) -> Tensor:
+        """
+        Hamiltonian function for the Riemannian manifold.
+
+        Parameters
+        ----------
+        q : torch.Tensor (b, d)
+            Position
+        p : torch.Tensor (b, d)
+            Momentum
+
+        Returns
+        -------
+        H : torch.Tensor (b,)
+            Hamiltonian value
+        """
+        H = self.cometric.dual_energy(q, p)
+        return 0.5 * H
+    
+    def forward(self, q, p):
+        return self.H(q, p)
+
 class ExpMapRanders(torch.nn.Module):
     """
+    Exponential map for a Randers metric.
     Shoot a geodesic trajectory on a Randers metric using the shooting method.
-    We use the hamiltonian formatuion via the dual Randers metric on the cotangent space.
+    We use the hamiltonian formulation via the dual Randers metric on the cotangent space.
 
     Parameters:
     -----------
@@ -4122,7 +4180,8 @@ class ExpMapRanders(torch.nn.Module):
         self.omega = omega
         self.n_fix_pts = n_fix_pts
 
-        self.dual_r = DualRandersMetrics(randers)
+        self.H = HamiltonianRanders(randers)
+        self.dual_r = self.H.dual_r
 
         if self.solver == "leapfrog_explicit":
             self.shooter = ExplicitLeapfrogIntegrator(
@@ -4195,25 +4254,6 @@ class ExpMapRanders(torch.nn.Module):
         v = torch.einsum("bij,bj->bi", g_inv, p)
         return v
 
-    def H(self, q: Tensor, p: Tensor) -> Tensor:
-        """
-        Hamiltonian function for the Riemannian manifold.
-
-        Parameters
-        ----------
-        q : torch.Tensor (b, d)
-            Position
-        p : torch.Tensor (b, d)
-            Momentum
-
-        Returns
-        -------
-        H : torch.Tensor (b,)
-            Hamiltonian value
-        """
-        H = self.dual_r(q, p)
-        return 0.5 * H**2
-
     def forward(self, q0: Tensor, v0: Tensor) -> tuple[Tensor, Tensor]:
         """
         Computes the geodesic trajectory starting from position q0 and initial speed v0
@@ -4239,6 +4279,7 @@ class ExpMapRanders(torch.nn.Module):
 
 class ExpMapRiemann(torch.nn.Module):
     """
+    Exponential map for a Riemannian metric.
     Shoot a geodesic trajectory on a Riemannain metric using the shooting method.
     We use the hamiltonian formulation.
 
@@ -4283,6 +4324,8 @@ class ExpMapRiemann(torch.nn.Module):
         self.solver = solver
         self.omega = omega
         self.n_fix_pts = n_fix_pts
+
+        self.H = HamiltonianRiemann(cometric)
 
         if self.solver == "leapfrog_explicit":
             self.shooter = ExplicitLeapfrogIntegrator(
@@ -4355,25 +4398,6 @@ class ExpMapRiemann(torch.nn.Module):
             G_inv_p = torch.einsum("bij,bj->bi", G_inv, p)
         return G_inv_p
 
-    def H(self, q: Tensor, p: Tensor) -> Tensor:
-        """
-        Hamiltonian function for the Riemannian manifold.
-
-        Parameters
-        ----------
-        q : torch.Tensor (b, d)
-            Position
-        p : torch.Tensor (b, d)
-            Momentum
-
-        Returns
-        -------
-        H : torch.Tensor (b,)
-            Hamiltonian value
-        """
-        H = self.cometric.dual_energy(q, p)
-        return 0.5 * H
-
     def forward(self, q0: Tensor, v0: Tensor) -> tuple[Tensor, Tensor]:
         """
         Computes the geodesic trajectory starting from position q0 and initial speed v0
@@ -4399,6 +4423,7 @@ class ExpMapRiemann(torch.nn.Module):
 
 class ExpMapFinsler(torch.nn.Module):
     """
+    Exponential map for a Finsler metric.
     Computes the geodesic distances between points using the shooting method
     on a Finsler metric.
 
