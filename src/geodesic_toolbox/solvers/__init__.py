@@ -1,11 +1,17 @@
 """
-Geodesic solvers: shooting, BVP, graph, GEORCE, cascade, spline,
-distance matrix, and exponential map solvers.
+Geodesic solvers: shooting, BVP, graph, GEORCE, chained (graph + refinement),
+spline, distance matrix, and exponential map solvers.
 """
 
 from .base import GeodesicDistanceSolver
 from .bvp import BVP_ode, BVP_shooting, BVP_wrapper
-from .chained import CascadeSolver, SolverGraphGEORCE, SolverGraphGEORCEFinsler
+from .chained import (
+    SolverGraphBVP,
+    SolverGraphGEORCE,
+    SolverGraphGEORCEFinsler,
+    SolverGraphSpline,
+    SolverGraphSplineFinsler,
+)
 from .distance_matrix import angle_mat, dst_mat, dst_mat_naive, dst_mat_vectorized
 from .expmap import (
     ExpMapFinsler,
@@ -27,8 +33,6 @@ from .spline import (
     GeodesicSolverSpline,
     GeodesicSolverSplineFinsler,
     GeodesicSpline,
-    SolverGraphSpline,
-    SolverGraphSplineFinsler,
 )
 
 __all__ = [
@@ -36,7 +40,6 @@ __all__ = [
     "BVP_ode",
     "BVP_shooting",
     "BVP_wrapper",
-    "CascadeSolver",
     "ExpMapFinsler",
     "ExpMapRanders",
     "ExpMapRiemann",
@@ -52,6 +55,7 @@ __all__ = [
     "HamiltonianRiemann",
     "ShootingSolver",
     "SolverGraph",
+    "SolverGraphBVP",
     "SolverGraphFinsler",
     "SolverGraphGEORCE",
     "SolverGraphGEORCEFinsler",
