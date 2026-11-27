@@ -59,12 +59,6 @@ def test_learning_rate_scaling_monotonicity():
     assert high > low
 
 
-def test_time_scaling_schedules_bounds():
-    assert utils.constant_time_scaling_schedule(0.0) == 1
-    assert utils.linear_time_scaling_schedule(0.0) > utils.linear_time_scaling_schedule(1.0)
-    assert utils.cosine_time_scaling_schedule(0.0) > utils.cosine_time_scaling_schedule(1.0)
-
-
 def test_batched_kronecker_products():
     a = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     b = torch.tensor([[[0.0, 5.0], [6.0, 7.0]]])

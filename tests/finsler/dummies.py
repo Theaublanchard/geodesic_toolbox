@@ -66,6 +66,6 @@ class Omega(torch.nn.Module):
     def forward(self, X):
         rho = self.amplitude(X).clip(0.0, 1.0)
         omega = self.direction(X)
-        omega_norm = self.cometric.cometric(X, omega).sqrt()
+        omega_norm = self.cometric.cometric(X, omega)
         omega = omega / (omega_norm[:, None] + 1e-8)
         return rho * omega

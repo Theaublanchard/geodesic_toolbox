@@ -66,7 +66,7 @@ KEY_NAMES = {
         "SolverGraphFinsler",
         "GEORCE",
         "GEORCEFinsler",
-        "CascadeSolver",
+        "SolverGraphBVP",
         "GeodesicSolverSpline",
         "ExpMapRanders",
         "ExpMapRiemann",
