@@ -135,8 +135,8 @@ class RandersMetrics(FinslerMetric):
 
         fst_term = (alpha / F)[:, None, None] * a_inv
 
-        b = self.omega(q)
-        beta = self.beta * torch.einsum("bi,bi->b", b, v)
+        b = self.beta * self.omega(q)
+        beta = torch.einsum("bi,bi->b", b, v)
         b_tilde_top = torch.einsum("bij,bj->bi", a_inv, b)
         b_tilde_norm = torch.einsum("bi,bi->b", b_tilde_top, b)
         l_tilde = v / alpha[:, None]
@@ -220,7 +220,7 @@ class RandersMetrics(FinslerMetric):
             v_norm = torch.sqrt(torch.einsum("bi,bi->b", G * v, v))
             Gv = G * v
         else:
-            v_norm = torch.sqrt(torch.einsum("bij,bj->b", G, v))
+            v_norm = torch.sqrt(torch.einsum("bij,bi,bj->b", G, v, v))
             Gv = torch.einsum("bij,bj->bi", G, v)
 
         beta = torch.einsum("bi,bi->b", omega, v)
