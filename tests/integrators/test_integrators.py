@@ -38,6 +38,16 @@ def _integrator_cases(pbar: bool):
             lambda method: method(q, p, 2),
         ),
         (
+            integrators.ImplicitEulerIntegrator(f, 0.1, N_fx=2, df=df, **pbar_kwargs),
+            lambda method: method(x, 2),
+        ),
+        (
+            integrators.HamiltonianImplicitEulerIntegrator(
+                hamiltonian, 0.1, N_fx=2, **pbar_kwargs
+            ),
+            lambda method: method(q, p, 2),
+        ),
+        (
             integrators.ImplicitMidpointIntegrator(f, df, 0.1, N_fx=2, **pbar_kwargs),
             lambda method: method(x, 2),
         ),
@@ -71,9 +81,11 @@ def test_public_names_exported_from_package():
         "ExplicitLeapfrogIntegrator",
         "Hamiltonian",
         "HamiltonianEulerIntegrator",
+        "HamiltonianImplicitEulerIntegrator",
         "HamiltonianImplicitMidpointIntegrator",
         "HamiltonianIntegrator",
         "HamiltonianToBatchedFunction",
+        "ImplicitEulerIntegrator",
         "ImplicitLeapfrogIntegrator",
         "ImplicitMidpointIntegrator",
         "Integrator",
@@ -114,6 +126,8 @@ def test_integrators_enable_progress_bars_when_requested(monkeypatch):
     assert progress_calls == [
         "Euler integration",
         "Euler integration",
+        "Implicit Euler integration",
+        "Implicit Euler integration",
         "Implicit midpoint integration",
         "Leapfrog integration",
         "Leapfrog integration",
@@ -141,6 +155,7 @@ def _hamiltonian_integrators():
         "explicit": integrators.ExplicitLeapfrogIntegrator(H, 0.1, omega=1.0),
         "midpoint": integrators.HamiltonianImplicitMidpointIntegrator(H, 0.1, N_fx=5),
         "euler": integrators.HamiltonianEulerIntegrator(H, 0.1),
+        "implicit_euler": integrators.HamiltonianImplicitEulerIntegrator(H, 0.1, N_fx=20),
     }
 
 
@@ -254,8 +269,8 @@ def test_hamiltonian_integrators_are_second_order(name):
 def test_hamiltonian_integrators_return_zero_log_det():
     q0, p0 = _quadratic_state()
     for name, integrator in _hamiltonian_integrators().items():
-        if name == "euler":
-            continue  # Euler is not volume-preserving
+        if name in ("euler", "implicit_euler"):
+            continue  # (Implicit) Euler are not volume-preserving
         _, _, log_det = integrator(q0, p0, 5)
         assert torch.allclose(log_det, torch.zeros(1)), f"{name} log_det not zero"
 
@@ -290,6 +305,112 @@ def test_euler_dirs_are_equivalent_to_negative_gamma():
     with_dirs, _ = integrators.EulerIntegrator(f, 0.1)(x0, 4, dirs=torch.tensor([-1.0]))
     reference, _ = integrators.EulerIntegrator(f, -0.1)(x0, 4)
     assert torch.allclose(with_dirs, reference, atol=1e-7)
+
+
+def test_generic_implicit_euler_matches_exact_discrete_map_and_log_det():
+    gamma = 0.1
+    L = 5
+    integrator = integrators.HamiltonianImplicitEulerIntegrator(
+        QuadraticHamiltonian(), gamma, N_fx=50
+    )
+    q0, p0 = _quadratic_state()
+    q1, p1, log_det = integrator(q0, p0, L)
+
+    # f([q,p]) = [p, -q]. The implicit Euler map is (I - gamma J4) x1 = x0,
+    # so x1 = (I - gamma J4)^{-1} x0.
+    I2 = torch.eye(2)
+    Z2 = torch.zeros(2, 2)
+    J4 = torch.cat([torch.cat([Z2, I2], dim=1), torch.cat([-I2, Z2], dim=1)], dim=0)
+    M = torch.linalg.inv(torch.eye(4) - gamma * J4)
+    x_expected = torch.cat([q0, p0], dim=1) @ torch.linalg.matrix_power(
+        M.transpose(0, 1), L - 1
+    )
+    q_expected, p_expected = torch.split(x_expected, 2, dim=1)
+    assert torch.allclose(q1, q_expected, atol=1e-5)
+    assert torch.allclose(p1, p_expected, atol=1e-5)
+
+    # Per step: det(I4 - gamma J4) = (1 + gamma^2)^2 (two symplectic 2x2 blocks).
+    expected_log_det = (L - 1) * 2 * math.log(1 + gamma**2)
+    assert torch.allclose(log_det, torch.full((1,), expected_log_det), atol=1e-5)
+
+
+def test_implicit_euler_dirs_are_equivalent_to_negative_gamma():
+    f = lambda x: -x
+    df = lambda x: -torch.eye(2).repeat(x.shape[0], 1, 1)
+    x0 = torch.tensor([[0.5, -0.2]])
+    with_dirs, _ = integrators.ImplicitEulerIntegrator(f, 0.1, N_fx=10, df=df)(
+        x0, 4, dirs=torch.tensor([-1.0])
+    )
+    reference, _ = integrators.ImplicitEulerIntegrator(f, -0.1, N_fx=10, df=df)(x0, 4)
+    assert torch.allclose(with_dirs, reference, atol=1e-6)
+
+
+def test_implicit_euler_is_stable_for_stiff_field():
+    # Implicit Euler on dx/dt = -10 x: the discrete map is x1 = x0 / (1 + gamma*10).
+    # For gamma*10 = 100 the map is contracting (|factor| < 1), unlike explicit
+    # Euler (factor = 1 - gamma*10 = -99) which would blow up.
+    # Newton converges in one iteration for a linear field, so it is the right
+    # choice here (Picard diverges when |gamma * A| > 1).
+    A = -10.0 * torch.eye(2)
+    f = lambda x: x @ A.T
+    df = lambda x: A.repeat(x.shape[0], 1, 1)
+    x0 = torch.tensor([[0.5, -0.2]])
+    gamma = 1.0
+    integrator = integrators.ImplicitEulerIntegrator(f, gamma, N_fx=2, df=df, method="newton")
+    x1, _ = integrator(x0, 3)
+    factor = 1.0 / (1.0 + gamma * 10.0)  # per step
+    expected = x0 * (factor**2)
+    assert torch.allclose(x1, expected, atol=1e-6)
+    assert torch.isfinite(x1).all()
+
+
+def test_implicit_euler_newton_matches_picard():
+    A = torch.tensor([[0.2, -0.1], [0.15, 0.05]])
+    f = lambda x: x @ A.T
+    df = lambda x: A.repeat(x.shape[0], 1, 1)
+    x0 = torch.tensor([[0.3, -0.4]])
+    picard, _ = integrators.ImplicitEulerIntegrator(f, 0.2, N_fx=3, df=df, method="picard")(
+        x0, 4
+    )
+    newton, _ = integrators.ImplicitEulerIntegrator(f, 0.2, N_fx=3, df=df, method="newton")(
+        x0, 4
+    )
+    assert torch.allclose(picard, newton, atol=1e-6)
+
+
+def test_implicit_euler_rejects_newton_without_df():
+    f = lambda x: x
+    with pytest.raises(ValueError, match="requires the field Jacobian"):
+        integrators.ImplicitEulerIntegrator(f, 0.1, N_fx=2, method="newton")
+    with pytest.raises(ValueError, match="requires the field Jacobian"):
+        integrators.ImplicitEulerIntegrator(f, 0.1, N_fx=2, jacobian="estimate")
+    with pytest.raises(ValueError, match="requires the field Jacobian"):
+        integrators.ImplicitEulerIntegrator(f, 0.1, N_fx=2, jacobian="exact")
+    with pytest.raises(ValueError, match="Unknown method"):
+        integrators.ImplicitEulerIntegrator(f, 0.1, N_fx=2, df=lambda x: x, method="bogus")
+    with pytest.raises(ValueError, match="Unknown jacobian method"):
+        integrators.ImplicitEulerIntegrator(f, 0.1, N_fx=2, df=lambda x: x, jacobian="bogus")
+
+
+def test_estimate_implicit_euler_log_det_jac_is_close_to_exact():
+    torch.manual_seed(0)
+    A = 0.05 * torch.eye(2)
+    f = lambda x: x @ A.T
+    df = lambda x: A.repeat(x.shape[0], 1, 1)
+    gamma = 0.2
+    L = 4
+    integrator = integrators.ImplicitEulerIntegrator(
+        f, gamma, N_fx=2, df=df, jacobian="estimate", jacobian_mc=256
+    )
+    _, log_det = integrator(torch.tensor([[0.3, -0.4]]), L)
+    exact = (L - 1) * torch.log(torch.det(torch.eye(2) - gamma * A))
+    assert abs(log_det.item() - exact.item()) < 0.05 * abs(exact.item())
+
+
+def test_hamiltonian_implicit_euler_exposes_H():
+    H = QuadraticHamiltonian()
+    integrator = integrators.HamiltonianImplicitEulerIntegrator(H, 0.1, N_fx=2)
+    assert integrator.H is H
 
 
 def test_generic_implicit_midpoint_matches_exact_implicit_step():
@@ -361,7 +482,9 @@ def test_estimate_log_det_jac_is_close_to_exact():
     assert abs(log_det.item() - exact.item()) < 0.05 * abs(exact.item())
 
 
-@pytest.mark.parametrize("name", ["separable", "implicit", "explicit", "midpoint", "euler"])
+@pytest.mark.parametrize(
+    "name", ["separable", "implicit", "explicit", "midpoint", "euler", "implicit_euler"]
+)
 def test_hamiltonian_return_traj_shapes_and_endpoints(name):
     L = 5
     integrator = _hamiltonian_integrators()[name]
@@ -434,6 +557,14 @@ def test_separable_leapfrog_substeps_scale_step_size():
             ),
             lambda: integrators.HamiltonianImplicitMidpointIntegrator(
                 QuadraticHamiltonian(), 0.1, N_fx=5
+            ),
+        ),
+        (
+            lambda: integrators.HamiltonianImplicitEulerIntegrator(
+                QuadraticHamiltonian(), 0.2, N_fx=50, substeps=2
+            ),
+            lambda: integrators.HamiltonianImplicitEulerIntegrator(
+                QuadraticHamiltonian(), 0.1, N_fx=50
             ),
         ),
     ],

@@ -8,7 +8,12 @@ with J the symplectic matrix and H the Hamiltonian function.
 """
 
 from .base import BatchedFunction, Integrator
-from .euler import EulerIntegrator, HamiltonianEulerIntegrator
+from .euler import (
+    EulerIntegrator,
+    HamiltonianEulerIntegrator,
+    HamiltonianImplicitEulerIntegrator,
+    ImplicitEulerIntegrator,
+)
 from .hamiltonian import Hamiltonian, HamiltonianIntegrator, HamiltonianToBatchedFunction
 from .implicit_midpoint import (
     HamiltonianImplicitMidpointIntegrator,
@@ -26,9 +31,11 @@ __all__ = [
     "ExplicitLeapfrogIntegrator",
     "Hamiltonian",
     "HamiltonianEulerIntegrator",
+    "HamiltonianImplicitEulerIntegrator",
     "HamiltonianImplicitMidpointIntegrator",
     "HamiltonianIntegrator",
     "HamiltonianToBatchedFunction",
+    "ImplicitEulerIntegrator",
     "ImplicitLeapfrogIntegrator",
     "ImplicitMidpointIntegrator",
     "Integrator",

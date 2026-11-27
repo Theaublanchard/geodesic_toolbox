@@ -40,6 +40,8 @@ KEY_NAMES = {
         "Integrator",
         "Hamiltonian",
         "EulerIntegrator",
+        "ImplicitEulerIntegrator",
+        "HamiltonianImplicitEulerIntegrator",
         "ImplicitMidpointIntegrator",
         "SeparableLeapfrogIntegrator",
         "ImplicitLeapfrogIntegrator",
