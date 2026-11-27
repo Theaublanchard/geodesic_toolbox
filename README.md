@@ -1,37 +1,31 @@
-# Geodesic Toolbox: Riemannian metric and Finsler metric learning in PyTorch
-
-<!-- [![PyPI version](https://img.shields.io/pypi/v/geodesic_toolbox.svg)](https://pypi.org/project/geodesic_toolbox/) -->
+# Geodesic Toolbox: Riemannian and Finsler metric learning in PyTorch
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CC BY-NC-ND 4.0](https://img.shields.io/badge/License-CC_BY--NC--ND_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-nd/4.0/)(LICENSE)
 
 ## Overview
 
-**Geodesic Toolbox** is a PyTorch-based library for computing geodesic distances, trajectories, and related differential geometric properties on Riemannian and Finsler manifolds. It provides a flexible, differentiable framework for working with user-defined metrics on manifolds represented as $(\mathbb{R}^d, g)$, where $g$ is a Riemannian metric. It aims to provide an easy to use library to solve tasks around metric learning.
+**Geodesic Toolbox** is a PyTorch library for computing geodesic distances, trajectories and related differential-geometric quantities on Riemannian and Finsler manifolds of the form $(\mathbb{R}^d, g)$. It is built around modelling metrics through their **cometric** $g^{-1}$, and provides a differentiable framework for metric learning: solvers, samplers and integrators can all be optimized through.
 
-The library is centered around the modeling of metrics via their cometric tensor $g^{-1}$, allowing for efficient computation of geodesics using various numerical solvers. It supports a wide range of built-in metrics, including Euclidean, Poincaré, Pullback metrics defined via neural networks, Fisher-Rao, and several Finsler metrics such as Randers and Matsumoto metrics. Users can also define custom metrics by subclassing the provided base classes.
+### Key features
 
-### Key Features
-
-- **Multiple Solver Implementations**: Shooting method, Boundary Value Problem (BVP) solvers, graph-based solvers, and the GEORCE algorithm
-- **Rich Metric Support**:
-  - Riemannian metrics (Identity, Poincaré, Pullback, Fisher-Rao, custom parametric)
-  - Finsler metrics (Randers, Matsumoto, Slope metrics)
-  - Metric composition and interpolation
-- **Fully Differentiable**: All computations are implemented in PyTorch, enabling gradient-based optimization through geodesics
-- **GPU Support**: Native CUDA support for large-scale computations
-- **Flexible Architecture**: Easy to define custom metrics and solvers
-- **Comprehensive Examples**: Jupyter notebooks demonstrating metric construction and geodesic computation
+- **Geodesic solvers** for both Riemannian and Finsler manifolds: GEORCE, graph solvers, chained graph + refinement solvers, shooting, BVP, spline and exponential-map solvers
+- **Rich metric support**: Euclidean, Poincaré, pullback, Fisher-Rao, centroid/LAND data-driven cometrics, parametric learnable cometrics, and Randers / Matsumoto / Slope Finsler metrics (including the dual Randers metric and the Binet-Legendre cometric)
+- **Samplers and integrators**: MALA, a family of Riemannian HMC samplers, and Hamiltonian integrators (Euler, leapfrog, implicit midpoint)
+- **Distance matrices**: batched pairwise geodesic distances via `dst_mat`
+- **Fully differentiable**: everything runs in PyTorch, so metrics can be optimized end-to-end
+- **GPU support**: native CUDA support for large-scale computations
+- **Examples**: Jupyter notebooks in `examples/`
 
 ## Installation
 
-We recommend using uv to install the project. To add the library as a dependency, run:
+We recommend [uv](https://docs.astral.sh/uv/). To use the library as a dependency:
 
 ```bash
 uv add git+https://github.com/Theaublanchard/geodesic_toolbox
 ```
 
-To install the library in development mode, clone the repository and run:
+To develop against the repository:
 
 ```bash
 git clone https://github.com/Theaublanchard/geodesic_toolbox.git
@@ -39,275 +33,280 @@ cd geodesic_toolbox
 uv sync
 ```
 
-And if you need it in another project, as editable, add the following to your library's `pyproject.toml`:
+To add it as an editable dependency of another project, put this in that project's `pyproject.toml`:
 
 ```toml
 [tool.uv.sources]
-geodesic-toolbox = { path = "geodesic_toolbox", editable = true }
+geodesic-toolbox = { path = "<path>/geodesic_toolbox", editable = true }
 ```
 
-## Quick Start
+## Quick start
 
-### Computing a Simple Geodesic Distance
+### Geodesic distance on a Riemannian manifold
 
 ```python
 import torch
-from geodesic_toolbox import ShootingSolver, IdentityCoMetric
+from geodesic_toolbox import IdentityCoMetric, GEORCE
 
-# Define the metric (Euclidean space)
+# Euclidean metric
 cometric = IdentityCoMetric()
-solver = ShootingSolver(cometric=cometric, lr=0.1, n_step=100, dt=0.01)
+solver = GEORCE(cometric, T=100, max_iter=200)
 
-# Two points on the manifold
 q0 = torch.tensor([[0.0, 0.0]])
 q1 = torch.tensor([[1.0, 1.0]])
 
-# Compute geodesic distance
 distance = solver(q0, q1)
 print(f"Geodesic distance: {distance.item():.4f}")
 ```
 
-### Using the Poincaré Ball Metric
+### Poincaré ball (hyperbolic) geometry
 
 ```python
-from geodesic_toolbox import PointCarreCoMetric
+from geodesic_toolbox import PointCarreCoMetric, GEORCE
 
-# Hyperbolic geometry on the Poincaré ball
 cometric = PointCarreCoMetric()
-solver = ShootingSolver(cometric=cometric, n_step=200)
+solver = GEORCE(cometric, T=100, max_iter=200)
 
-# Points inside the unit ball
 q0 = torch.tensor([[0.0, 0.0]])
-q1 = torch.tensor([[0.5, 0.5]])
+q1 = torch.tensor([[0.5, 0.5]])  # inside the unit ball
 
-# Hyperbolic distance
 distance = solver(q0, q1)
 print(f"Hyperbolic distance: {distance.item():.4f}")
 ```
 
-### Custom Riemannian Metrics
+### Custom Riemannian metric via a neural network (pullback)
 
 ```python
-from geodesic_toolbox import PullBackCometric
 import torch.nn as nn
+from geodesic_toolbox import IdentityCoMetric, PullBackCometric, GEORCE
 
 
-# Define a diffeomorphism (e.g., neural network)
 class MyDiffeomorphism(nn.Module):
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3),  # Output dimension
-        )
+        self.net = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, 2))
 
     def forward(self, x):
         return self.net(x)
 
 
-# Create pullback metric
-diffeo = MyDiffeomorphism()
 cometric = PullBackCometric(
-    diffeo=diffeo,
+    diffeo=MyDiffeomorphism(),
     base_cometric=IdentityCoMetric(is_diag=False),
     method="finite_difference",
 )
-
-solver = ShootingSolver(cometric=cometric, n_step=100)
+solver = GEORCE(cometric, T=100, max_iter=200)
 distance = solver(q0, q1)
 ```
 
-## Solver Methods
+### Randers (Finsler) metric
 
-The library provides multiple algorithms for geodesic computation, each with different trade-offs:
-
-### 1. **Graph-Based Solver** (recommended for large datasets)
-
-Uses KNN graphs for fast approximate geodesics on data manifolds.
+A Randers metric is $F(x, v) = |v|_{g(x)} + \beta\, \omega(x) \cdot v$ with a 1-form $\omega$ satisfying the Randers condition $\|\beta\, \omega(x)\|_{g(x)^{-1}} < 1$.
 
 ```python
-from geodesic_toolbox import SolverGraph
+import torch.nn as nn
+from geodesic_toolbox import IdentityCoMetric, RandersMetrics, GEORCEFinsler
 
-# Requires a reference dataset
+
+class Omega(nn.Module):
+    """1-form omega(x) = rho(x) * dir(x), with a cometric-normalized direction."""
+
+    def __init__(self, dim: int, base_cometric):
+        super().__init__()
+        self.direction = nn.Linear(dim, dim)
+        self.amplitude = nn.Linear(dim, 1)
+        self.base_cometric = base_cometric
+
+    def forward(self, x):
+        rho = self.amplitude(x).clip(0.0, 1.0)
+        omega = self.direction(x)
+        # base_cometric.cometric(x, omega) is the dual norm ||omega||_{g^-1}
+        omega = omega / (self.base_cometric.cometric(x, omega)[:, None] + 1e-8)
+        return rho * omega
+
+
+base = IdentityCoMetric()
+randers = RandersMetrics(base_cometric=base, omega=Omega(2, base), beta=0.5)
+solver = GEORCEFinsler(randers, T=100, max_iter=200)
+distance = solver(q0, q1)
+```
+
+Every solver in the library accepts batches of start/end points `(b, d)` and is differentiable in `x`, `v` and in the metric parameters.
+
+## Solvers
+
+All solvers implement the same interface: `solver(q0, q1)` returns the geodesic distance, and most expose `get_trajectories(q0, q1)`.
+
+| Solver          | Class                                                      | Manifold   | Notes                                                       |
+| --------------- | ---------------------------------------------------------- | ---------- | ----------------------------------------------------------- |
+| GEORCE          | `GEORCE` / `GEORCEFinsler`                             | both       | Energy-minimizing trajectory; accurate, needs good init.    |
+| Graph           | `SolverGraph` / `SolverGraphFinsler`                   | both       | Fast, data-driven (KNN graph), approximate.                 |
+| Graph + GEORCE  | `SolverGraphGEORCE` / `SolverGraphGEORCEFinsler`       | both       | Graph initialisation, GEORCE refinement.                    |
+| Graph + Spline  | `SolverGraphSpline` / `SolverGraphSplineFinsler`       | both       | Graph initialisation, spline refinement.                    |
+| Graph + BVP     | `SolverGraphBVP`                                         | Riemannian | Graph initialisation, BVP refinement.                       |
+| Shooting        | `ShootingSolver`                                         | Riemannian | Optimises initial momentum; fails on complex metrics.       |
+| BVP             | `BVP_ode` / `BVP_shooting`                             | Riemannian | Solves the geodesic ODE as a BVP (non-diagonal metrics).    |
+| Spline          | `GeodesicSolverSpline` / `GeodesicSolverSplineFinsler` | both       | Spline parameterisation of the curve.                       |
+| Exponential map | `ExpMapRiemann` / `ExpMapRanders` / `ExpMapFinsler`  | both       | Integrates the (Hamiltonian) geodesic flow from `(q, v)`. |
+
+### Graph-based solvers (fast, data-driven)
+
+```python
+import torch
+from geodesic_toolbox import IdentityCoMetric, SolverGraph, SolverGraphFinsler
+
 data = torch.randn(1000, 2)
+cometric = IdentityCoMetric()
 
 solver = SolverGraph(
     cometric=cometric,
     data=data,
     n_neighbors=10,
-    dt=0.01,  # Trajectory discretization
+    T=100,          # trajectory discretisation
     batch_size=64,
-    max_data_count=500,  # Subsample for memory efficiency
+    max_data_count=500,  # subsample for memory efficiency
 )
-
 distance = solver(q0, q1)
 ```
 
-**Advantages**: Very fast, handles non-convex regions
-**Disadvantages**: Requires training data, approximate distances
-
-### 4. **GEORCE Solver**
-
-Control-theoretic approach optimizing geodesic energy.
+### Chained solvers (graph initialisation + refinement)
 
 ```python
-from geodesic_toolbox import GEORCE
-
-solver = GEORCE(
-    cometric=cometric,
-    T=100,  # Trajectory discretization
-    max_iter=200,  # Maximum iterations
-    tol=1e-6,  # Convergence tolerance
-    c=0.9,
-    rho=0.5,  # Line search parameters
-)
-
-distance = solver(q0, q1)
-```
-
-**Advantages**: Highly accurate
-**Disadvantages**: Slower, requires careful tuning or good initialisation
-
-### 3. **Hybrid Solver (Graph-Based + GEORCE)**
-
-Combines graph-based initialization with GEORCE refinement.
-
-```python
-from geodesic_toolbox import SolverGraphGEORCE
+from geodesic_toolbox import SolverGraphGEORCE, SolverGraphGEORCEFinsler
 
 solver = SolverGraphGEORCE(
-    cometric=cometric, data=data, n_neighbors=10, T=100, max_iter=100, tol=1e-6
-)
-distance = solver(q0, q1)
-```
-
-**Advantages**: Balances speed and accuracy
-**Disadvantages**: Requires to have training data. Longer runtime than pure graph-based solver.
-
-## 4. **Shooting Solver** (not recommended for complex metrics)
-
-Uses Hamiltonian mechanics to find geodesics by optimizing initial momentum.
-
-```python
-from geodesic_toolbox import ShootingSolver
-
-solver = ShootingSolver(
     cometric=cometric,
-    lr=0.1,  # Learning rate for optimization
-    n_step=100,  # Number of optimization steps
-    dt=0.01,  # Time discretization step
-    method="euler",  # Integrator: "euler" or "leapfrog"
-    convergence_threshold=1e-3,  # Stop when endpoint error below threshold
+    data=data,
+    n_neighbors=10,
+    T=100,
+    max_iter=100,
+    tol=1e-5,
 )
-
 distance = solver(q0, q1)
-trajectory = solver.get_trajectories(q0, q1)  # Get full path
+
+# Same interface for the Finsler variant
+solver = SolverGraphGEORCEFinsler(finsler=randers, data=data, n_neighbors=10)
 ```
 
-**Advantages**: Accurate
-**Disadvantages**: Fails on complex metrics with singularities, expensive optimisation, doesn't work on Finsler metrics
-
-### 5. **Boundary Value Problem (BVP) Solvers**
-
-Directly solves the geodesic equation as a boundary value problem.
+### Exponential map (trajectory from an initial velocity)
 
 ```python
-from geodesic_toolbox import BVP_ode
+from geodesic_toolbox import ExpMapRanders
 
-solver = BVP_ode(
-    cometric=cometric,
-    T=100,  # Number of discretization points
-    dim=2,  # Manifold dimension
-    verbose=0,  # Verbosity of scipy.integrate.solve_bvp
-)
-
-distance = solver(q0, q1)
+expmap = ExpMapRanders(randers=randers, T_max=10.0, T=500, substeps=4)
+traj_q, traj_v = expmap(q0, v0)
 ```
 
-**Advantages**: Accurate for smooth metrics
-**Disadvantages**: Slow, high memory usage, may fail on complex metrics
+## Supported metrics
 
-## Supported Metrics
+### Riemannian cometrics
 
-### Riemannian Metrics
+| Metric         | Class                                                                                      | Use case                                 |
+| -------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------- |
+| Euclidean      | `IdentityCoMetric`                                                                       | Baseline                                 |
+| Poincaré ball | `PointCarreCoMetric`                                                                     | Hyperbolic geometry                      |
+| Pullback       | `PullBackCometric`                                                                       | Neural-network-defined metrics           |
+| Fisher-Rao     | `FisherRaoCometric`                                                                      | Information geometry                     |
+| Lifted         | `LiftedCometric`                                                                         | Level-set constraints                    |
+| Centroid RBF   | `CentroidsCometric`                                                                      | Gaussian interpolation at data centroids |
+| LAND           | `LANDCometric`, `LANDRBFCometric`                                                      | Data-driven diagonal cometrics           |
+| Soft-abs       | `SoftAbsCometric`                                                                        | Enforcing positive definiteness          |
+| Parametric     | `DiagonalCometricModel`, `CometricModel`, `Cometric_MLP`, `SmallConvCometricModel` | Learnable metrics                        |
 
-| Metric          | Class                         | Use Case                       |
-| --------------- | ----------------------------- | ------------------------------ |
-| Euclidean       | `IdentityCoMetric`          | Baseline                       |
-| Poincaré Ball  | `PointCarreCoMetric`        | Hyperbolic geometry            |
-| Pullback Metric | `PullBackCometric`          | Neural network-defined metrics |
-| Fisher-Rao      | `FisherRaoCometric`         | Information geometry           |
-| Lifted Metric   | `LiftedCometric`            | Level set constraints          |
-| Interpolated    | `CentroidsCometric`         | Data-driven metrics            |
-| Parametric      | `DiagonalCometricModel` ... | Learnable metrics              |
+### Finsler metrics
 
-### Finsler Metrics
+| Metric         | Class                    | Use case                                    |
+| -------------- | ------------------------ | ------------------------------------------- |
+| Randers        | `RandersMetrics`       | Direction-dependent geometry                |
+| Dual Randers   | `DualRandersMetrics`   | Dual (cotangent) Randers metric             |
+| Binet-Legendre | `BinetLegendreRanders` | Binet-Legendre cometric of a Randers metric |
+| Matsumoto      | `MatsumotoMetrics`     | Alternative Finsler metric                  |
+| Slope          | `SlopeMetrics`         | Terrain-based metrics                       |
 
-| Metric    | Class                | Use Case                       |
-| --------- | -------------------- | ------------------------------ |
-| Randers   | `RandersMetrics`   | Directional-dependent geometry |
-| Matsumoto | `MatsumotoMetrics` | Alternative Finsler metric     |
-| Slope     | `SlopeMetrics`     | Terrain-based metrics          |
+### Metric composition
 
-### Metric Composition
+Cometrics can be scaled, added, wrapped, and used anywhere a cometric is expected:
 
 ```python
-from geodesic_toolbox import IdentityCoMetric, ScaledCometric, SumOfCometric
+from geodesic_toolbox import IdentityCoMetric, PointCarreCoMetric, SoftAbsCometric
 
-# Scale a metric
 scaled = 10.5 * IdentityCoMetric()
-
-# Sum two metrics
 combined = IdentityCoMetric() + PointCarreCoMetric()
 
-# Use in solver
-solver = ShootingSolver(cometric=combined + scaled)
+# Enforce positive-definiteness of any metric
+safe = SoftAbsCometric(PointCarreCoMetric(), alpha=1e3)
+
+solver = GEORCE(combined, T=100, max_iter=200)
 ```
 
-## Advanced Usage
+## Samplers and integrators
 
-### Differentiable Optimization Through Geodesics
+For sampling and Hamiltonian dynamics on manifolds:
 
-Since all operations are differentiable, you can optimize parameters to minimize geodesic distances:
+```python
+from geodesic_toolbox import (
+    IdentityCoMetric,
+    ImplicitMidpointRHMCSampler,
+    MALA,
+    EulerIntegrator,
+    ImplicitMidpointIntegrator,
+    SeparableLeapfrogIntegrator,
+)
+
+# Riemannian HMC-style sampler on a cometric
+sampler = ImplicitMidpointRHMCSampler(
+    cometric=IdentityCoMetric(),
+    num_integration_steps=10,
+    fixed_point_iterations=100,
+    step_size=0.1,
+    log_target=lambda x: -0.5 * (x**2).sum(dim=-1),
+)
+
+# MALA given a log-target and its score
+mala = MALA(
+    log_target=lambda x: -0.5 * (x**2).sum(dim=-1),
+    score_func=lambda x: -x,
+    step_size=0.1,
+)
+```
+
+Samplers and integrators are also available for Finsler manifolds (e.g. `ExplicitRHMCSampler`, `HamiltonianMonteCarlo`); see `geodesic_toolbox.samplers` and `geodesic_toolbox.integrators` for the full list.
+
+## Advanced usage
+
+### Differentiable optimisation through geodesics
+
+Since all operations are differentiable, you can optimise metric parameters to shape geodesic distances:
 
 ```python
 import torch
-import torch.nn as nn
-from geodesic_toolbox import ShootingSolver, DiagonalCometricModel
+from geodesic_toolbox import DiagonalCometricModel, GEORCE
 
-# Learnable metric
-metric = DiagonalCometricModel(in_dim=2, hidden_dim=32, latent_dim=2)
+metric = DiagonalCometricModel(in_dim=2, hidden_dim=32, latent_dim=2, lbd=1e-3)
 optimizer = torch.optim.Adam(metric.parameters(), lr=1e-3)
-solver = ShootingSolver(cometric=metric, n_step=50)
+solver = GEORCE(metric, T=100, max_iter=50)
 
-# Training loop
-for epoch in range(100):
-    q0 = torch.randn(32, 2, requires_grad=True)
-    q1 = torch.randn(32, 2, requires_grad=True)
-
-    distances = solver(q0, q1)
-    loss = distances.mean()
+for _ in range(100):
+    q0 = torch.randn(32, 2)
+    q1 = torch.randn(32, 2)
+    loss = solver(q0, q1).mean()
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 ```
 
-### Visualization
+### Visualising trajectories
 
 ```python
 import matplotlib.pyplot as plt
-from geodesic_toolbox import ShootingSolver
 
-solver = ShootingSolver(cometric=cometric, n_step=100)
 traj = solver.get_trajectories(q0, q1)
 
-# Plot trajectory
 plt.figure(figsize=(8, 8))
 plt.plot(traj[0, :, 0].detach(), traj[0, :, 1].detach(), "b-", label="Geodesic")
-plt.scatter([q0[0, 0]], [q0[0, 1]], c="green", s=100, label="Start")
-plt.scatter([q1[0, 0]], [q1[0, 1]], c="red", s=100, label="End")
+plt.scatter([q0[0, 0].item()], [q0[0, 1].item()], c="green", s=100, label="Start")
+plt.scatter([q1[0, 0].item()], [q1[0, 1].item()], c="red", s=100, label="End")
 plt.legend()
 plt.axis("equal")
 plt.show()
@@ -315,49 +314,27 @@ plt.show()
 
 ## Examples
 
-Complete examples are available in the `examples/` directory:
+Complete examples are available in `examples/`:
 
-- `explore_riemannian_metric.ipynb` - Basic Riemannian geodesics
-- `explore_riemannian_solvers.ipynb` - Comparing different solvers
-- `explore_randers_metric.ipynb` - Finsler metric computation
-- `explore_randers_solvers.ipynb` - Advanced Finsler examples
+- `explore_riemannian_metric.ipynb` — basic Riemannian geodesics
+- `explore_riemannian_solvers.ipynb` — comparing different solvers
+- `explore_randers_metric.ipynb` — building and inspecting a Randers metric
+- `explore_randers_solvers.ipynb` — solvers on a Finsler manifold
+- `explore_randers_hamiltonian.ipynb` — Hamiltonian formulation and exponential maps
 
-Run them with:
+## Performance considerations
 
-```bash
-jupyter notebook examples/
-```
-
-## Performance Considerations
-
-### Memory Usage
-
-The library can be memory-intensive for high-dimensional data. It is recommended to use diagonal metrics (CoMetric.is_diag=True) when possible. Some approxiation strategies used are : batch processing, finite difference Jacobian computation, and graph solvers...
-
-### Numerical Stability
-
-```python
-# Ensure positive-definite metrics
-from geodesic_toolbox import SoftAbsCometric
-
-safe_cometric = SoftAbsCometric(cometric, alpha=1e3)
-
-# Add regularization
-cometric = CometricModel(..., lbd=1e-3)
-```
+- **Memory**: high-dimensional data can be memory-intensive. Prefer diagonal cometrics (`is_diag=True`) where possible, and use the graph solvers or `max_data_count` subsampling for large datasets.
+- **Numerical stability**: wrap uncertain metrics in `SoftAbsCometric` and add regularisation (`lbd`) in parametric cometrics to keep them positive definite.
+- **Finsler condition**: for `RandersMetrics`, keep $\|\beta\, \omega(x)\|_{g^{-1}} < 1$ everywhere — the tests and notebooks clamp the 1-form amplitude accordingly.
 
 ## Testing
 
-Run the test suite:
-
 ```bash
-pytest tests/ -v
-```
+uv run pytest tests/ -v
 
-Coverage report:
-
-```bash
-pytest tests/ --cov=geodesic_toolbox
+# with coverage
+uv run pytest --cov=geodesic_toolbox --cov-report=term-missing
 ```
 
 ## Citation
@@ -379,39 +356,21 @@ Contributions are welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
-
-<!-- ## Roadmap
-
-- [ ] Higher-order derivatives (for Christoffel symbols)
-- [ ] Improved memory efficiency for high-dimensional jacobians
-- [ ] Additional Finsler metric types
-- [ ] Batch geodesic distance matrices
-- [ ] Riemannian optimization utilities -->
-
-<!-- ## Documentation
-
-Comprehensive documentation is available at [docs/](docs/):
-
-- [Getting Started](docs/getting_started.md)
-- [API Reference](docs/api_reference.md)
-- [Algorithms](docs/algorithms.md)
-- [Theory](docs/theory.md) -->
 
 ## Authors
 
-- **Théau Blanchard** - Initial development
+- **Théau Blanchard** — initial development
 
 ## License
 
-This project is licensed under the CC BY-NC-ND 4.0 License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the CC BY-NC-ND 4.0 License — see the [LICENSE](LICENSE) file for details.
 
 ## Support
 
-For issues, questions, or suggestions:
+For issues, questions or suggestions:
 
 - Open an [Issue](https://github.com/Theaublanchard/geodesic_toolbox/issues)
 - Start a [Discussion](https://github.com/Theaublanchard/geodesic_toolbox/discussions)
-- Check [Discussions](docs/FAQ.md) for FAQs
