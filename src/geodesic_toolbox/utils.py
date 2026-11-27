@@ -1,4 +1,4 @@
-from math import ceil, cos, exp
+from math import ceil, exp
 
 import numpy as np
 import torch
@@ -218,61 +218,6 @@ def scale_lr_magnification(mf: float, base_lr: float) -> float:
     coef = 0.5
     new_lr = (1 - exp(-coef * mf)) * max_scale * base_lr + min_scale * base_lr
     return new_lr
-
-
-def constant_time_scaling_schedule(x: float) -> float:
-    """
-    Constant time scaling schedule.
-    Results in ceil(1/dt)*(n_step + 1) integration steps.
-
-    Parameters:
-    ----------
-    x : float
-        Current iteration progress (0 to 1)
-
-    Returns:
-    -------
-    scaling : float
-        Scaling factor
-    """
-    return 1
-
-
-def linear_time_scaling_schedule(x: float, max_scaling: float = 5) -> float:
-    """Linear ramp from max_scaling to 1.
-    Results in ()*(n_step + 1) integration steps.
-
-    Parameters:
-    ----------
-    x : float
-        Current iteration progress (0 to 1)
-    max_scaling : float
-        Maximum scaling factor
-
-    Returns:
-    -------
-    scaling : float
-        Scaling factor
-    """
-    return 1 + (max_scaling - 1) * (1 - x)
-
-
-def cosine_time_scaling_schedule(x: float, max_scaling: float = 5) -> float:
-    """Cosine decay from max_scaling to 1
-
-    Parameters:
-    ----------
-    x : float
-        Current iteration progress (0 to 1)
-    max_scaling : float
-        Maximum scaling factor
-
-    Returns:
-    -------
-    scaling : float
-        Scaling factor
-    """
-    return 1 + (max_scaling - 1) * (1 + cos(x * 3.1415)) / 2
 
 
 def get_mf_image(
@@ -681,15 +626,12 @@ def empirical_diag_cov_mat(x: Tensor, mu: Tensor = None, eps: float = 1e-6) -> T
 
 __all__ = [
     "batched_kro",
-    "constant_time_scaling_schedule",
-    "cosine_time_scaling_schedule",
     "delta",
     "empirical_cov_mat",
     "empirical_diag_cov_mat",
     "get_bounds",
     "get_mf_image",
     "hamiltonian",
-    "linear_time_scaling_schedule",
     "magnification_factor",
     "magnification_factor_metric",
     "pointcarre_dst",

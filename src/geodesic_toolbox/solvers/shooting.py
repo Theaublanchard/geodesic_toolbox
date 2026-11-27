@@ -3,14 +3,69 @@ Shooting solver for geodesic distances.
 """
 
 from collections.abc import Callable
-from math import ceil
+from math import ceil, cos
 
 import torch
 from torch import Tensor
 
 from ..cometric import CoMetric, IdentityCoMetric
-from ..utils import cosine_time_scaling_schedule, magnification_factor, scale_lr_magnification
+from ..utils import magnification_factor, scale_lr_magnification
 from .base import GeodesicDistanceSolver
+
+
+def constant_time_scaling_schedule(x: float) -> float:
+    """
+    Constant time scaling schedule.
+    Results in ceil(1/dt)*(n_step + 1) integration steps.
+
+    Parameters:
+    ----------
+    x : float
+        Current iteration progress (0 to 1)
+
+    Returns:
+    -------
+    scaling : float
+        Scaling factor
+    """
+    return 1
+
+
+def linear_time_scaling_schedule(x: float, max_scaling: float = 5) -> float:
+    """Linear ramp from max_scaling to 1.
+    Results in ()*(n_step + 1) integration steps.
+
+    Parameters:
+    ----------
+    x : float
+        Current iteration progress (0 to 1)
+    max_scaling : float
+        Maximum scaling factor
+
+    Returns:
+    -------
+    scaling : float
+        Scaling factor
+    """
+    return 1 + (max_scaling - 1) * (1 - x)
+
+
+def cosine_time_scaling_schedule(x: float, max_scaling: float = 5) -> float:
+    """Cosine decay from max_scaling to 1
+
+    Parameters:
+    ----------
+    x : float
+        Current iteration progress (0 to 1)
+    max_scaling : float
+        Maximum scaling factor
+
+    Returns:
+    -------
+    scaling : float
+        Scaling factor
+    """
+    return 1 + (max_scaling - 1) * (1 + cos(x * 3.1415)) / 2
 
 
 class ShootingSolver(GeodesicDistanceSolver):
@@ -24,8 +79,7 @@ class ShootingSolver(GeodesicDistanceSolver):
     dt : float, final integration step of the hamiltonian. It is higly recommended to choose a value such that dt* ceil(1/dt) = 1 for numerical stability
     method : str, type of integrator
     convergence_threshold : float, if not None, optimise until the distance between the endpoint and the target is below this threshold. Else, optimise for n_step iterations.
-    time_scaling_schedule : Callable[float]->float, function from [0,1] to R+ that scales the time step of the integrator. It should be decreasing and such that time_scaling_schedule(1) = 1.
-        It is used to decrease the time step as the optimisation converges. Only used when convergence_threshold is None.
+    time_scaling_schedule : str, name of the time scaling schedule to use. Choose one of ["constant", "linear", "cosine"].
     scale_lr : bool, whether to scale the learning rate with the magnification factor or not. This is to avoid shooting being stuck in high curvature region.
 
     Output:
@@ -40,10 +94,15 @@ class ShootingSolver(GeodesicDistanceSolver):
         dt: float = 0.01,
         method: str = "euler",
         convergence_threshold: float | None = None,
-        time_scaling_schedule: Callable[[float], float] = cosine_time_scaling_schedule,
+        time_scaling_schedule: str = "cosine",
         scale_lr: bool = True,
         verbose: bool = False,
     ) -> None:
+        SCHEDULES = {
+            "constant": constant_time_scaling_schedule,
+            "linear": linear_time_scaling_schedule,
+            "cosine": cosine_time_scaling_schedule,
+        }
 
         super().__init__(cometric=cometric)
         self.dt = dt
@@ -51,7 +110,11 @@ class ShootingSolver(GeodesicDistanceSolver):
         self.n_pts = ceil(1 / self.dt)
         self.lr = lr
         self.n_step = n_step
-        self.time_scaling_schedule = time_scaling_schedule
+        assert time_scaling_schedule in SCHEDULES, (
+            f"Unknown time scaling schedule {time_scaling_schedule}. Choose one of {list(SCHEDULES.keys())}"
+        )
+        self.time_scaling_schedule = SCHEDULES[time_scaling_schedule]
+
         self.scale_lr = scale_lr
         self.verbose = verbose
 
